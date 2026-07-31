@@ -1,13 +1,24 @@
 # Dados e arquivos temporários locais
-data/*.db
-data/temporary_uploads/
+**/data/*.db
+**/data/temporary_uploads/
 
 # Cache Python
 __pycache__/
 **/__pycache__/
 *.py[cod]
 
-# Ambiente e ferramentas locais
+# Ambientes e ferramentas locais
 .venv/
+venv/
+env/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
+
+# Credenciais locais
+.env
+.env.*
+!.env.example
+*.pem
+*.key

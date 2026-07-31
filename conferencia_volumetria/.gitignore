@@ -1,0 +1,13 @@
+# Dados e arquivos temporários locais
+data/*.db
+data/temporary_uploads/
+
+# Cache Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Ambiente e ferramentas locais
+.venv/
+.pytest_cache/
+.coverage
