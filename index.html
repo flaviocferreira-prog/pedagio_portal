@@ -42,7 +42,7 @@
                 <span>Operação <strong id="summary-operation"></strong></span>
                 <span>Turno <strong id="summary-shift"></strong></span>
                 <span>Importado em <strong id="summary-imported-at"></strong></span>
-                <span id="summary-finalized-wrap" hidden>Finalizada em <strong id="summary-finalized-at"></strong></span>
+                <span id="summary-finalized-wrap" hidden><span id="summary-ended-label">Finalizada em</span> <strong id="summary-finalized-at"></strong></span>
             </div>
 
             <div class="summary">
@@ -66,12 +66,14 @@
             </form>
             <p id="scan-helper" class="helper">Bipe ou cole o código; a conferência é automática.</p>
             <p id="completion-notice" class="notice warning" hidden>100% conferido — aguardando finalização</p>
+            <p id="historical-notice" class="notice warning" hidden>Resultado de uma conferência anterior — somente consulta.</p>
 
             <div class="conference-actions">
                 <button id="finish-button" type="button">Finalizar conferência</button>
-                <button id="restart-button" class="danger-outline" type="button">Reiniciar conferência</button>
                 <button id="cancel-conference-button" class="danger-button" type="button">Cancelar conferência</button>
+                <button id="print-button" class="secondary" type="button" hidden>Imprimir</button>
                 <button id="sync-button" class="secondary" type="button" hidden>Sincronizar</button>
+                <button id="authorize-reconference-button" class="danger-outline" type="button" hidden>Autorizar reconferência</button>
             </div>
 
             <div class="lists-grid">
@@ -92,17 +94,6 @@
             </div>
         </section>
 
-        <dialog id="restart-modal" aria-labelledby="restart-title">
-            <form id="restart-form" method="dialog">
-                <h2 id="restart-title">Reiniciar conferência</h2>
-                <p>Tem certeza de que deseja reiniciar esta conferência?</p>
-                <p class="helper">As bipagens e divergências da tentativa atual serão zeradas. O palete e as caixas esperadas serão mantidos.</p>
-                <div class="dialog-actions">
-                    <button id="restart-cancel" class="secondary" type="button">Cancelar</button>
-                    <button id="restart-confirm" class="danger-button" type="submit">Reiniciar</button>
-                </div>
-            </form>
-        </dialog>
         <dialog id="finish-modal" aria-labelledby="finish-title">
             <form id="finish-form" method="dialog">
                 <h2 id="finish-title">Finalizar conferência</h2>
@@ -136,11 +127,22 @@
         <dialog id="cancel-conference-modal" aria-labelledby="cancel-conference-title">
             <form id="cancel-conference-form" method="dialog">
                 <h2 id="cancel-conference-title">Cancelar conferência</h2>
-                <p>Todo o progresso e as caixas importadas desta conferência serão apagados.</p>
-                <p class="helper">Será necessário importar o arquivo novamente para iniciar outra conferência.</p>
+                <p>A conferência será interrompida. As caixas, leituras e divergências permanecerão no histórico.</p>
+                <p class="helper">Será necessário importar um novo arquivo para iniciar outra conferência.</p>
                 <div class="dialog-actions">
                     <button id="cancel-conference-dismiss" class="secondary" type="button">Voltar</button>
                     <button id="cancel-conference-confirm" class="danger-button" type="submit">Confirmar cancelamento</button>
+                </div>
+            </form>
+        </dialog>
+        <dialog id="reconference-modal" aria-labelledby="reconference-title">
+            <form id="reconference-form" method="dialog">
+                <h2 id="reconference-title">Autorizar reconferência</h2>
+                <p>Uma nova conferência será criada, preservando integralmente o resultado anterior.</p>
+                <label for="reconference-reason">Justificativa (mínimo de 10 caracteres)<textarea id="reconference-reason" required minlength="10"></textarea></label>
+                <div class="dialog-actions">
+                    <button id="reconference-dismiss" class="secondary" type="button">Voltar</button>
+                    <button id="reconference-confirm" class="danger-button" type="submit">Autorizar</button>
                 </div>
             </form>
         </dialog>

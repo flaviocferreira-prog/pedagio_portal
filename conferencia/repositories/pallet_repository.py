@@ -8,6 +8,7 @@ from conferencia.domain.box_codes import normalize_caixa_estoque
 from conferencia.domain.entities import (
     CartonStatus,
     CollaboratorContext,
+    ConferenceStatus,
     ScanClassification,
 )
 from conferencia.infrastructure.database import SQLiteDatabase
@@ -20,10 +21,12 @@ class RepositoryStateError(Exception):
 
 
 class PendingConferenceError(Exception):
-    def __init__(self, missing: int, divergent: int) -> None:
+    def __init__(self, missing: int, divergent: int, extra: int, duplicate: int) -> None:
         super().__init__("A conferência possui pendências.")
         self.missing = missing
         self.divergent = divergent
+        self.extra = extra
+        self.duplicate = duplicate
 
 
 class ActiveConferenceError(Exception):
@@ -46,19 +49,31 @@ class PalletRepository:
         origin: str,
         operation: str,
         shift: str,
-    ) -> None:
+        content_hash: str,
+    ) -> dict[str, object]:
         with self.database.connection(immediate=True) as connection:
+            history = self._history_by_content_hash(connection, content_hash)
+            finished = next((row for row in history if row["conference_status"] == ConferenceStatus.FINISHED), None)
+            if finished is not None:
+                self._audit(connection, finished["id"], collaborator, "IMPORT_FINALIZED_CONTENT", content_hash, "BLOCKED")
+                return {"action": "already_completed", "public_id": finished["public_id"]}
+            opened = next((row for row in history if row["conference_status"] == ConferenceStatus.OPEN), None)
+            if opened is not None:
+                self._audit(connection, opened["id"], collaborator, "IMPORT_OPEN_CONTENT", content_hash, "RESUMED")
+                return {"action": "resumed", "public_id": opened["public_id"]}
             active = self._active_for_collaborator(connection, collaborator.id)
             if active is not None:
                 raise ActiveConferenceError(active["public_id"])
+            previous = next((row for row in history if row["conference_status"] == ConferenceStatus.CANCELLED), None)
             cursor = connection.execute(
                 """
                 INSERT INTO pallets(
                     code, public_id, collaborator_id, source_filename,
                     source_fingerprint, import_origin, import_operation, imported_shift,
-                    imported_at, created_by_collaborator_id, total_expected, updated_at
+                    imported_at, created_by_collaborator_id, total_expected, updated_at,
+                    conference_status, print_status, content_hash, previous_conference_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     public_id,
@@ -73,6 +88,10 @@ class PalletRepository:
                     collaborator.id,
                     len(carton_codes),
                     None,
+                    ConferenceStatus.OPEN,
+                    "AVAILABLE",
+                    content_hash,
+                    previous["id"] if previous is not None else None,
                 ),
             )
             pallet_id = int(cursor.lastrowid)
@@ -86,7 +105,7 @@ class PalletRepository:
             connection.execute(
                 """
                 INSERT INTO conference_attempts(pallet_id, attempt_number, status)
-                VALUES (?, 1, 'READY')
+                VALUES (?, 1, 'IN_PROGRESS')
                 """,
                 (pallet_id,),
             )
@@ -94,13 +113,135 @@ class PalletRepository:
             # tentativa terem sido persistidas, ainda antes do commit atômico.
             imported_at = self._now(connection)
             connection.execute(
-                "UPDATE pallets SET imported_at = ?, updated_at = ? WHERE id = ?",
-                (imported_at, imported_at, pallet_id),
+                """
+                UPDATE pallets
+                SET status = 'IN_PROGRESS', imported_at = ?, started_at = ?,
+                    started_by_collaborator_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (imported_at, imported_at, collaborator.id, imported_at, pallet_id),
             )
+            connection.execute(
+                """
+                UPDATE conference_attempts
+                SET started_at = ?, started_by_collaborator_id = ?
+                WHERE pallet_id = ? AND attempt_number = 1
+                """,
+                (imported_at, collaborator.id, pallet_id),
+            )
+            action = "created_after_cancellation" if previous is not None else "created"
+            self._audit(
+                connection, pallet_id, collaborator,
+                "CREATED_AFTER_CANCELLATION" if previous is not None else "CONTENT_IMPORT_CREATED",
+                content_hash, "CREATED",
+            )
+            return {
+                "action": action,
+                "public_id": public_id,
+                "previous_public_id": previous["public_id"] if previous is not None else None,
+            }
+
+    @staticmethod
+    def _history_by_content_hash(
+        connection: sqlite3.Connection, content_hash: str
+    ) -> list[sqlite3.Row]:
+        return connection.execute(
+            """
+            SELECT id, public_id, conference_status
+            FROM pallets
+            WHERE content_hash = ?
+            ORDER BY CASE conference_status
+                WHEN 'FINALIZADA' THEN 1 WHEN 'EM_ABERTO' THEN 2
+                WHEN 'CANCELADA' THEN 3 ELSE 4 END, id DESC
+            """,
+            (content_hash,),
+        ).fetchall()
+
+    @staticmethod
+    def _audit(
+        connection: sqlite3.Connection,
+        pallet_id: int | None,
+        collaborator: CollaboratorContext,
+        action: str,
+        content_hash: str,
+        result: str,
+        justification: str | None = None,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO conference_audit_events(
+                pallet_id, collaborator_id, registration, profile, action,
+                content_hash, justification, result, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (pallet_id, collaborator.id, collaborator.registration, collaborator.shift,
+             action, content_hash, justification, result, PalletRepository._now(connection)),
+        )
 
     def find_active_by_collaborator(self, collaborator_id: int) -> sqlite3.Row | None:
         with self.database.connection() as connection:
             return self._active_for_collaborator(connection, collaborator_id)
+
+    def create_reconference(
+        self, previous_public_id: str, public_id: str,
+        collaborator: CollaboratorContext, reason: str,
+    ) -> str:
+        with self.database.connection(immediate=True) as connection:
+            previous = connection.execute(
+                "SELECT * FROM pallets WHERE public_id = ?", (previous_public_id,)
+            ).fetchone()
+            if previous is None:
+                raise RepositoryStateError("NOT_FOUND")
+            if previous["conference_status"] != ConferenceStatus.FINISHED:
+                raise RepositoryStateError("NOT_FINISHED")
+            active = self._active_for_collaborator(connection, collaborator.id)
+            if active is not None:
+                raise ActiveConferenceError(active["public_id"])
+            codes = [row["code"] for row in connection.execute(
+                "SELECT code FROM expected_cartons WHERE pallet_id = ? ORDER BY id", (previous["id"],)
+            )]
+            now = self._now(connection)
+            cursor = connection.execute(
+                """
+                INSERT INTO pallets(
+                    code, public_id, collaborator_id, source_filename, source_fingerprint,
+                    import_origin, import_operation, imported_shift, imported_at,
+                    created_by_collaborator_id, total_expected, updated_at, status,
+                    conference_status, print_status, content_hash, previous_conference_id,
+                    is_reconference, reconference_authorized_by, reconference_reason,
+                    reconference_authorized_at, started_at, started_by_collaborator_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_PROGRESS', ?, 'AVAILABLE', ?, ?, 1, ?, ?, ?, ?, ?)
+                """,
+                (public_id, public_id, collaborator.registration, previous["source_filename"],
+                 previous["source_fingerprint"], previous["import_origin"], previous["import_operation"],
+                 collaborator.shift, now, collaborator.id, len(codes), now, ConferenceStatus.OPEN,
+                 previous["content_hash"], previous["id"], collaborator.id, reason, now, now, collaborator.id),
+            )
+            pallet_id = int(cursor.lastrowid)
+            connection.executemany(
+                "INSERT INTO expected_cartons(pallet_id, code) VALUES (?, ?)",
+                [(pallet_id, normalize_caixa_estoque(code)) for code in codes],
+            )
+            connection.execute(
+                """INSERT INTO conference_attempts(
+                    pallet_id, attempt_number, status, started_at, started_by_collaborator_id
+                ) VALUES (?, 1, 'IN_PROGRESS', ?, ?)""",
+                (pallet_id, now, collaborator.id),
+            )
+            self._audit(connection, pallet_id, collaborator, "RECONFERENCIA_AUTORIZADA",
+                        previous["content_hash"], "CREATED", reason)
+            return public_id
+
+    def record_audit_for_public_id(
+        self, public_id: str, collaborator: CollaboratorContext, action: str,
+        result: str, justification: str | None = None,
+    ) -> None:
+        with self.database.connection(immediate=True) as connection:
+            pallet = connection.execute(
+                "SELECT id, content_hash FROM pallets WHERE public_id = ?", (public_id,)
+            ).fetchone()
+            self._audit(connection, pallet["id"] if pallet else None, collaborator, action,
+                        pallet["content_hash"] if pallet else "", result, justification)
 
     def find_latest_finalized_by_collaborator(
         self, collaborator_id: int
@@ -111,9 +252,8 @@ class PalletRepository:
                 SELECT public_id
                 FROM pallets
                 WHERE created_by_collaborator_id = ?
-                  AND cancelled_at IS NULL
-                  AND status = 'COMPLETED'
-                ORDER BY finished_at DESC, id DESC
+                  AND conference_status IN ('FINALIZADA', 'CANCELADA')
+                ORDER BY COALESCE(finished_at, cancelled_at) DESC, id DESC
                 LIMIT 1
                 """,
                 (collaborator_id,),
@@ -129,7 +269,11 @@ class PalletRepository:
                        created_by_collaborator_id, started_by_collaborator_id,
                        finished_by_collaborator_id, cancelled_at,
                        cancelled_by_collaborator_id, import_origin, import_operation,
-                       imported_shift, imported_at
+                       imported_shift, imported_at, conference_status,
+                       productivity_boxes_per_hour, print_status, content_hash,
+                       previous_conference_id, is_reconference,
+                       reconference_authorized_by, reconference_reason,
+                       reconference_authorized_at
                 FROM pallets
                 WHERE public_id = ?
                 """,
@@ -210,7 +354,7 @@ class PalletRepository:
                 (pallet["id"],),
             ).fetchall()
         registration = pallet["collaborator_registration"] or pallet["collaborator_id"]
-        workflow_status = self._workflow_status(pallet, counts)
+        workflow_status = str(pallet["conference_status"])
         return {
             "public_id": pallet["public_id"],
             "collaborator_id": registration,
@@ -220,6 +364,10 @@ class PalletRepository:
                 "name": pallet["collaborator_name"] or "",
             },
             "source_filename": pallet["source_filename"],
+            "content_hash": pallet["content_hash"],
+            "previous_conference_id": pallet["previous_conference_id"],
+            "is_reconference": bool(pallet["is_reconference"]),
+            "reconference_reason": pallet["reconference_reason"],
             "importation": {
                 "origin": pallet["import_origin"],
                 "operation": pallet["import_operation"],
@@ -227,7 +375,7 @@ class PalletRepository:
                 "imported_at": self._format_local_datetime(pallet["imported_at"]),
                 "imported_at_iso": pallet["imported_at"],
             },
-            "status": "CANCELLED" if pallet["cancelled_at"] else pallet["status"],
+            "status": workflow_status,
             "workflow_status": workflow_status,
             "display_status": self._display_status(workflow_status),
             "created_at": pallet["created_at"],
@@ -237,7 +385,13 @@ class PalletRepository:
                 "finished_at": self._format_local_datetime(pallet["finished_at"]),
                 "finished_at_iso": pallet["finished_at"],
             },
+            "cancellation": {
+                "cancelled_at": self._format_local_datetime(pallet["cancelled_at"]),
+                "cancelled_at_iso": pallet["cancelled_at"],
+            },
             "duration_seconds": pallet["duration_seconds"],
+            "productivity_boxes_per_hour": pallet["productivity_boxes_per_hour"],
+            "print_status": pallet["print_status"],
             "sync_status": pallet["sync_status"],
             "final_justification": pallet["final_justification"],
             "active_attempt": {
@@ -296,81 +450,53 @@ class PalletRepository:
         }
 
     def cancel(self, pallet_id: int, collaborator: CollaboratorContext) -> None:
-        """Remove apenas os dados operacionais deste palete em uma transação."""
+        """Cancela sem apagar caixas, leituras, divergências ou auditoria."""
         with self.database.connection(immediate=True) as connection:
             pallet = connection.execute(
-                "SELECT status, cancelled_at FROM pallets WHERE id = ?", (pallet_id,)
+                "SELECT conference_status, started_at FROM pallets WHERE id = ?", (pallet_id,)
             ).fetchone()
             if pallet is None:
                 raise RepositoryStateError("NOT_FOUND")
-            if pallet["cancelled_at"] is not None:
+            if pallet["conference_status"] == ConferenceStatus.CANCELLED:
                 raise RepositoryStateError("CANCELLED")
-            if pallet["status"] not in ("READY", "IN_PROGRESS"):
+            if pallet["conference_status"] != ConferenceStatus.OPEN:
                 raise RepositoryStateError("FINISHED")
-            now = self._now(connection)
-            connection.execute(
-                "DELETE FROM synchronization_attempts WHERE pallet_id = ?", (pallet_id,)
-            )
-            connection.execute(
-                """
-                DELETE FROM attempt_confirmations
-                WHERE attempt_id IN (SELECT id FROM conference_attempts WHERE pallet_id = ?)
-                """,
-                (pallet_id,),
-            )
-            connection.execute("DELETE FROM scan_events WHERE pallet_id = ?", (pallet_id,))
-            connection.execute("DELETE FROM unexpected_cartons WHERE pallet_id = ?", (pallet_id,))
-            connection.execute("DELETE FROM expected_cartons WHERE pallet_id = ?", (pallet_id,))
-            connection.execute("DELETE FROM conference_attempts WHERE pallet_id = ?", (pallet_id,))
-            updated = connection.execute(
-                """
-                UPDATE pallets
-                SET status = 'COMPLETED_WITH_DIVERGENCE', cancelled_at = ?,
-                    cancelled_by_collaborator_id = ?, finished_at = ?,
-                    final_justification = 'CANCELADA', sync_status = 'NOT_READY',
-                    updated_at = ?
-                WHERE id = ? AND cancelled_at IS NULL
-                """,
-                (now, collaborator.id, now, now, pallet_id),
-            )
-            if updated.rowcount != 1:
-                raise RepositoryStateError("CANCELLED")
-
-    def start(self, pallet_id: int, collaborator: CollaboratorContext) -> None:
-        with self.database.connection(immediate=True) as connection:
-            pallet = connection.execute(
-                "SELECT status, cancelled_at FROM pallets WHERE id = ?", (pallet_id,)
-            ).fetchone()
-            if pallet is None:
-                raise RepositoryStateError("NOT_FOUND")
-            if pallet["cancelled_at"] is not None:
-                raise RepositoryStateError("CANCELLED")
-            if pallet["status"] == "IN_PROGRESS":
-                return
-            if pallet["status"] != "READY":
-                raise RepositoryStateError("FINISHED")
-            attempt = self._latest_attempt(connection, pallet_id)
             now = self._now(connection)
             updated = connection.execute(
                 """
                 UPDATE pallets
-                SET status = 'IN_PROGRESS', started_at = ?,
-                    started_by_collaborator_id = ?, updated_at = ?
-                WHERE id = ? AND status = 'READY'
+                SET status = 'COMPLETED_WITH_DIVERGENCE', conference_status = ?,
+                    cancelled_at = ?, cancelled_by_collaborator_id = ?, finished_at = ?,
+                    duration_seconds = MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER)),
+                    final_justification = 'CANCELADA', sync_status = 'NOT_READY', updated_at = ?
+                WHERE id = ? AND conference_status = ?
                 """,
-                (now, collaborator.id, now, pallet_id),
+                (ConferenceStatus.CANCELLED, now, collaborator.id, now, now, now, pallet_id, ConferenceStatus.OPEN),
             )
             if updated.rowcount != 1:
                 raise RepositoryStateError("CHANGED")
             connection.execute(
                 """
-                UPDATE conference_attempts
-                SET status = 'IN_PROGRESS', started_at = ?,
-                    started_by_collaborator_id = ?
-                WHERE id = ? AND status = 'READY'
+                UPDATE conference_attempts SET status = 'COMPLETED', finished_at = ?,
+                    finished_by_collaborator_id = ?
+                WHERE pallet_id = ? AND status = 'IN_PROGRESS'
                 """,
-                (now, collaborator.id, attempt["id"]),
+                (now, collaborator.id, pallet_id),
             )
+
+    def start(self, pallet_id: int, collaborator: CollaboratorContext) -> None:
+        # O cronômetro nasce no upload. Esta rota legada permanece idempotente
+        # para clientes já publicados, sem reiniciar horário ou progresso.
+        with self.database.connection() as connection:
+            pallet = connection.execute(
+                "SELECT conference_status FROM pallets WHERE id = ?", (pallet_id,)
+            ).fetchone()
+            if pallet is None:
+                raise RepositoryStateError("NOT_FOUND")
+            if pallet["conference_status"] == ConferenceStatus.CANCELLED:
+                raise RepositoryStateError("CANCELLED")
+            if pallet["conference_status"] != ConferenceStatus.OPEN:
+                raise RepositoryStateError("FINISHED")
 
     def process_scan(
         self,
@@ -380,12 +506,14 @@ class PalletRepository:
     ) -> tuple[ScanClassification, str | None]:
         with self.database.connection(immediate=True) as connection:
             pallet = connection.execute(
-                "SELECT status, started_at, cancelled_at FROM pallets WHERE id = ?", (pallet_id,)
+                "SELECT status, conference_status, started_at, cancelled_at FROM pallets WHERE id = ?", (pallet_id,)
             ).fetchone()
             if pallet is None:
                 raise RepositoryStateError("NOT_FOUND")
             if pallet["cancelled_at"] is not None:
                 raise RepositoryStateError("CANCELLED")
+            if pallet["conference_status"] != ConferenceStatus.OPEN:
+                raise RepositoryStateError("FINISHED")
             if pallet["status"] != "IN_PROGRESS" or pallet["started_at"] is None:
                 raise RepositoryStateError(
                     "FINISHED" if pallet["status"].startswith("COMPLETED") else "NOT_STARTED"
@@ -508,39 +636,47 @@ class PalletRepository:
     def finish(self, pallet_id: int, collaborator: CollaboratorContext) -> None:
         with self.database.connection(immediate=True) as connection:
             pallet = connection.execute(
-                "SELECT status, started_at, cancelled_at FROM pallets WHERE id = ?", (pallet_id,)
+                "SELECT conference_status, started_at FROM pallets WHERE id = ?", (pallet_id,)
             ).fetchone()
             if pallet is None:
                 raise RepositoryStateError("NOT_FOUND")
-            if pallet["cancelled_at"] is not None:
+            if pallet["conference_status"] == ConferenceStatus.CANCELLED:
                 raise RepositoryStateError("CANCELLED")
-            if pallet["status"] != "IN_PROGRESS":
-                raise RepositoryStateError("FINISHED")
+            if pallet["conference_status"] == ConferenceStatus.FINISHED:
+                return
+            if pallet["conference_status"] != ConferenceStatus.OPEN or not pallet["started_at"]:
+                raise RepositoryStateError("NOT_STARTED")
             attempt = self._latest_attempt(connection, pallet_id)
+            if attempt is None or attempt["status"] != "IN_PROGRESS":
+                raise RepositoryStateError("CHANGED")
             counts = self._counts(connection, pallet_id, attempt["id"])
             missing = max(0, counts["expected"] - counts["confirmed"])
-            if missing:
-                raise PendingConferenceError(missing, 0)
+            if missing or counts["extra"] or counts["duplicate"]:
+                raise PendingConferenceError(
+                    missing, counts["extra"], counts["extra"], counts["duplicate"]
+                )
             now = self._now(connection)
+            duration = connection.execute(
+                "SELECT MAX(0, CAST((julianday(?) - julianday(?)) * 86400 AS INTEGER)) AS seconds",
+                (now, pallet["started_at"]),
+            ).fetchone()["seconds"]
+            productivity = (counts["confirmed"] * 3600 / duration) if duration else float(counts["confirmed"])
             updated = connection.execute(
                 """
                 UPDATE pallets
-                SET status = 'COMPLETED', finished_at = ?,
-                    duration_seconds = MAX(
-                        0, CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER)
-                    ),
+                SET status = 'COMPLETED', conference_status = ?, finished_at = ?,
+                    duration_seconds = ?, productivity_boxes_per_hour = ?,
                     finished_by_collaborator_id = ?, sync_status = 'PENDING',
                     final_justification = NULL, updated_at = ?
-                WHERE id = ? AND status = 'IN_PROGRESS'
+                WHERE id = ? AND conference_status = ?
                 """,
-                (now, now, collaborator.id, now, pallet_id),
+                (ConferenceStatus.FINISHED, now, duration, productivity, collaborator.id, now, pallet_id, ConferenceStatus.OPEN),
             )
             if updated.rowcount != 1:
                 raise RepositoryStateError("CHANGED")
             connection.execute(
                 """
-                UPDATE conference_attempts
-                SET status = 'COMPLETED', finished_at = ?,
+                UPDATE conference_attempts SET status = 'COMPLETED', finished_at = ?,
                     finished_by_collaborator_id = ?
                 WHERE id = ? AND status = 'IN_PROGRESS'
                 """,
@@ -548,68 +684,7 @@ class PalletRepository:
             )
 
     def restart(self, pallet_id: int, collaborator: CollaboratorContext) -> None:
-        with self.database.connection(immediate=True) as connection:
-            pallet = connection.execute(
-                "SELECT status, cancelled_at FROM pallets WHERE id = ?", (pallet_id,)
-            ).fetchone()
-            if pallet is None:
-                raise RepositoryStateError("NOT_FOUND")
-            if pallet["cancelled_at"] is not None:
-                raise RepositoryStateError("CANCELLED")
-            if pallet["status"] != "IN_PROGRESS":
-                raise RepositoryStateError(
-                    "FINISHED" if pallet["status"].startswith("COMPLETED") else "NOT_STARTED"
-                )
-            current = self._latest_attempt(connection, pallet_id)
-            if current is None or current["status"] != "IN_PROGRESS":
-                raise RepositoryStateError("CHANGED")
-            now = self._now(connection)
-            updated = connection.execute(
-                """
-                UPDATE conference_attempts
-                SET status = 'RESTARTED', finished_at = ?,
-                    restarted_by_collaborator_id = ?
-                WHERE id = ? AND status = 'IN_PROGRESS'
-                """,
-                (now, collaborator.id, current["id"]),
-            )
-            if updated.rowcount != 1:
-                raise RepositoryStateError("CHANGED")
-            connection.execute(
-                """
-                UPDATE expected_cartons
-                SET status = 'PENDING', confirmed_at = NULL,
-                    confirmed_by_collaborator_id = NULL, confirmed_attempt_id = NULL
-                WHERE pallet_id = ?
-                """,
-                (pallet_id,),
-            )
-            connection.execute(
-                """
-                INSERT INTO conference_attempts(
-                    pallet_id, attempt_number, status, started_at,
-                    started_by_collaborator_id
-                )
-                VALUES (?, ?, 'IN_PROGRESS', ?, ?)
-                """,
-                (
-                    pallet_id,
-                    int(current["attempt_number"]) + 1,
-                    now,
-                    collaborator.id,
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE pallets
-                SET status = 'IN_PROGRESS', started_at = ?, finished_at = NULL,
-                    duration_seconds = NULL, final_justification = NULL,
-                    sync_status = 'NOT_READY', started_by_collaborator_id = ?,
-                    finished_by_collaborator_id = NULL, updated_at = ?
-                WHERE id = ?
-                """,
-                (now, collaborator.id, now, pallet_id),
-            )
+        raise RepositoryStateError("RESTART_DISABLED")
 
     def list_recent(self) -> list[dict]:
         with self.database.connection() as connection:
@@ -636,8 +711,7 @@ class PalletRepository:
             SELECT public_id
             FROM pallets
             WHERE created_by_collaborator_id = ?
-              AND cancelled_at IS NULL
-              AND status IN ('READY', 'IN_PROGRESS')
+              AND conference_status = 'EM_ABERTO'
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -652,13 +726,13 @@ class PalletRepository:
     ) -> None:
         with self.database.connection(immediate=True) as connection:
             pallet = connection.execute(
-                "SELECT status, cancelled_at FROM pallets WHERE id = ?", (pallet_id,)
+                "SELECT conference_status FROM pallets WHERE id = ?", (pallet_id,)
             ).fetchone()
             if pallet is None:
                 raise RepositoryStateError("NOT_FOUND")
-            if pallet["cancelled_at"] is not None:
+            if pallet["conference_status"] == ConferenceStatus.CANCELLED:
                 raise RepositoryStateError("CANCELLED")
-            if pallet["status"] != "COMPLETED":
+            if pallet["conference_status"] != ConferenceStatus.FINISHED:
                 raise RepositoryStateError("NOT_FINISHED")
             now = self._now(connection)
             connection.execute(
@@ -751,28 +825,10 @@ class PalletRepository:
     @staticmethod
     def _display_status(status: str) -> str:
         return {
-            "READY": "PRONTA",
-            "IN_PROGRESS": "EM CONFERÊNCIA",
-            "AGUARDANDO_FINALIZACAO": "100% CONFERIDO — AGUARDANDO FINALIZAÇÃO",
+            "EM_ABERTO": "EM ABERTO",
             "FINALIZADA": "CONFERÊNCIA FINALIZADA",
             "CANCELADA": "CANCELADA",
-            "COMPLETED": "CONFERÊNCIA FINALIZADA",
-            "COMPLETED_WITH_DIVERGENCE": "FINALIZADA COM DIVERGÊNCIA",
         }.get(status, status)
-
-    @staticmethod
-    def _workflow_status(pallet: sqlite3.Row, counts: dict[str, int]) -> str:
-        if pallet["cancelled_at"]:
-            return "CANCELADA"
-        if pallet["status"] == "COMPLETED":
-            return "FINALIZADA"
-        if (
-            pallet["status"] == "IN_PROGRESS"
-            and counts["expected"] > 0
-            and counts["confirmed"] == counts["expected"]
-        ):
-            return "AGUARDANDO_FINALIZACAO"
-        return str(pallet["status"])
 
     @staticmethod
     def _summary(
@@ -788,11 +844,13 @@ class PalletRepository:
             "total_confirmed": confirmed,
             "total_missing": missing,
             "total_extra": extra,
+            "total_divergent": extra,
             "total_duplicate_reads": duplicate,
             "coverage_percent": round(coverage, 2),
             "expected_quantity": expected,
             "confirmed_quantity": confirmed,
             "pending_quantity": missing,
             "surplus_quantity": extra,
+            "divergent_quantity": extra,
             "duplicate_quantity": duplicate,
         }

@@ -5,8 +5,8 @@ import { startTimer } from "./timer.js";
 let conference = null;
 let scanning = false;
 let finishing = false;
-let restarting = false;
 let cancelling = false;
+let authorizingReconference = false;
 let scanSequence = 0;
 let scanTimer = null;
 const boxElements = new Map();
@@ -14,7 +14,7 @@ const $ = (selector) => document.querySelector(selector);
 const AUTO_SCAN_DELAY_MS = 160;
 
 function isActiveConference(data) {
-  return data && ["READY", "IN_PROGRESS"].includes(data.status);
+  return data && data.status === "EM_ABERTO";
 }
 
 export function showImportCard() {
@@ -30,7 +30,7 @@ function normalizeCaixaEstoque(value) {
 }
 
 function renderSummary(data) {
-  if (!data || data.workflow_status === "CANCELADA") {
+  if (!data) {
     showImportCard();
     return false;
   }
@@ -46,8 +46,11 @@ function renderSummary(data) {
   $("#summary-shift").textContent = importation.shift || "Não informado";
   $("#summary-imported-at").textContent = importation.imported_at || data.created_at || "";
   const finalization = data.finalization || {};
-  $("#summary-finalized-wrap").hidden = !finalization.finished_at;
-  $("#summary-finalized-at").textContent = finalization.finished_at || "";
+  const cancellation = data.cancellation || {};
+  const endedAt = finalization.finished_at || cancellation.cancelled_at || "";
+  $("#summary-finalized-wrap").hidden = !endedAt;
+  $("#summary-ended-label").textContent = data.status === "CANCELADA" ? "Cancelada em" : "Finalizada em";
+  $("#summary-finalized-at").textContent = endedAt;
   const collaborator = data.collaborator || {};
   $("#summary-collaborator").textContent =
     `${collaborator.name || ""} — ${collaborator.registration || data.collaborator_id}`.trim();
@@ -63,15 +66,17 @@ function renderSummary(data) {
   $("#progress").value = summary.coverage_percent;
   $("#box-count").textContent = `${summary.total_expected} caixas`;
   $("#extra-count").textContent = `${summary.total_extra} divergentes`;
-  const active = data.status === "IN_PROGRESS";
-  const awaitingFinalization = data.workflow_status === "AGUARDANDO_FINALIZACAO";
+  const active = data.status === "EM_ABERTO";
+  const awaitingFinalization = active && summary.coverage_percent === 100;
   $("#carton-form").hidden = !active;
   $("#finish-button").hidden = !active;
   $("#finish-button").classList.toggle("ready-to-finish", awaitingFinalization);
-  $("#restart-button").hidden = !active;
   $("#cancel-conference-button").hidden = !active;
   $("#completion-notice").hidden = !awaitingFinalization;
-  $("#sync-button").hidden = data.workflow_status !== "FINALIZADA";
+  $("#historical-notice").hidden = data.action !== "already_completed";
+  $("#sync-button").hidden = data.status !== "FINALIZADA";
+  $("#print-button").hidden = data.status !== "FINALIZADA";
+  $("#authorize-reconference-button").hidden = !data.can_authorize_reconference;
   startTimer(data);
   return true;
 }
@@ -124,7 +129,7 @@ export function render(data) {
   }
   renderExpectedBoxes(data.cartons);
   renderExtras(data.unexpected_cartons);
-  if (data.status === "IN_PROGRESS") $("#carton-code").focus();
+  if (data.status === "EM_ABERTO") $("#carton-code").focus();
 }
 
 function applyScanResult(data) {
@@ -142,12 +147,6 @@ function applyScanResult(data) {
 
 async function renderAndStart(data) {
   render(data);
-  if (data.status === "READY") {
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-    const started = await api(`/api/conferences/${encodeURIComponent(data.public_id)}/start`, { method: "POST", body: "{}" });
-    render(started);
-    return started;
-  }
   return data;
 }
 
@@ -184,7 +183,7 @@ export function bindConference() {
 
   async function processScan(value) {
     const caixaEstoque = normalizeCaixaEstoque(value);
-    if (scanning || !conference || conference.status !== "IN_PROGRESS" || !caixaEstoque) return;
+    if (scanning || !conference || conference.status !== "EM_ABERTO" || !caixaEstoque) return;
     scanning = true;
     input.disabled = true;
     scanButton.disabled = true;
@@ -230,7 +229,7 @@ export function bindConference() {
 
   const finishModal = $("#finish-modal");
   $("#finish-button").addEventListener("click", () => {
-    if (conference?.status === "IN_PROGRESS") finishModal.showModal();
+    if (conference?.status === "EM_ABERTO") finishModal.showModal();
   });
   $("#finish-cancel").addEventListener("click", () => finishModal.close());
   $("#finish-form").addEventListener("submit", async (event) => {
@@ -252,27 +251,6 @@ export function bindConference() {
     }
   });
 
-  const restartModal = $("#restart-modal");
-  $("#restart-button").addEventListener("click", () => restartModal.showModal());
-  $("#restart-cancel").addEventListener("click", () => restartModal.close());
-  $("#restart-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    if (restarting || !conference) return;
-    restarting = true;
-    $("#restart-confirm").disabled = true;
-    try {
-      restartModal.close();
-      render(await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/restart`, { method: "POST", body: "{}" }));
-      notify("Conferência reiniciada. Uma nova tentativa foi criada.");
-    } catch (error) {
-      notify(error.message, "error");
-    } finally {
-      restarting = false;
-      $("#restart-confirm").disabled = false;
-      input.focus();
-    }
-  });
-
   const cancelModal = $("#cancel-conference-modal");
   $("#cancel-conference-button").addEventListener("click", () => cancelModal.showModal());
   $("#cancel-conference-dismiss").addEventListener("click", () => cancelModal.close());
@@ -284,8 +262,7 @@ export function bindConference() {
     try {
       const result = await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/cancel`, { method: "POST", body: "{}" });
       cancelModal.close();
-      sessionStorage.removeItem("conference_public_id");
-      showImportCard();
+      render(result);
       notify(result.message, "success");
       $("#new-import-button").focus();
     } catch (error) {
@@ -301,6 +278,34 @@ export function bindConference() {
       notify((await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/sync`, { method: "POST", body: "{}" })).message);
     } catch (error) {
       notify(error.message, "error");
+    }
+  });
+  $("#print-button").addEventListener("click", () => window.print());
+
+  const reconferenceModal = $("#reconference-modal");
+  $("#authorize-reconference-button").addEventListener("click", () => {
+    if (conference?.status === "FINALIZADA") reconferenceModal.showModal();
+  });
+  $("#reconference-dismiss").addEventListener("click", () => reconferenceModal.close());
+  $("#reconference-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const reason = $("#reconference-reason").value.trim();
+    if (authorizingReconference || reason.length < 10 || !conference) return;
+    authorizingReconference = true;
+    $("#reconference-confirm").disabled = true;
+    try {
+      const result = await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/reconference`, {
+        method: "POST", body: JSON.stringify({ justificativa: reason }),
+      });
+      reconferenceModal.close();
+      $("#reconference-reason").value = "";
+      render(result);
+      notify(result.message, "success");
+    } catch (error) {
+      notify(error.message, "error");
+    } finally {
+      authorizingReconference = false;
+      $("#reconference-confirm").disabled = false;
     }
   });
 }

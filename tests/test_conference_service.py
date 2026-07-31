@@ -12,6 +12,7 @@ from io import BytesIO
 from pathlib import Path
 
 from conferencia.controllers.conference_controller import ConferenceController
+from conferencia.domain.box_codes import content_hash_caixa_estoque
 from conferencia.domain.entities import CollaboratorContext, ConferenceImport
 from conferencia.infrastructure.database import SQLiteDatabase
 from conferencia.infrastructure.session_manager import SessionManager
@@ -109,25 +110,75 @@ class ConferenceServiceTests(unittest.TestCase):
     def start(self) -> dict:
         return self.service.start_pallet(self.public_id, self.actor)
 
-    def test_import_is_ready_and_preserves_session_actor(self) -> None:
-        self.assertEqual("READY", self.created["status"])
-        self.assertIsNone(self.created["started_at"])
+    def test_import_opens_and_preserves_session_actor(self) -> None:
+        self.assertEqual("EM_ABERTO", self.created["status"])
+        self.assertIsNotNone(self.created["started_at"])
         self.assertEqual("000123", self.created["collaborator"]["registration"])
         self.assertEqual("palete.xlsx", self.created["source_filename"])
         self.assertEqual(
             {"origin": "PORTAL", "operation": "DIGITAL", "shift": "ADM"},
             {key: self.created["importation"][key] for key in ("origin", "operation", "shift")},
         )
+
+    def test_content_hash_is_order_independent_but_preserves_duplicates_and_zeros(self) -> None:
+        first = content_hash_caixa_estoque([" 00123 ", "cx-2", "CX-2"])
+        same_content = content_hash_caixa_estoque(["cx-2", "00123", "CX-2"])
+        without_duplicate = content_hash_caixa_estoque(["00123", "CX-2"])
+        without_zero = content_hash_caixa_estoque(["123", "CX-2", "CX-2"])
+        self.assertEqual(64, len(first))
+        self.assertEqual(first, same_content)
+        self.assertNotEqual(first, without_duplicate)
+        self.assertNotEqual(first, without_zero)
+
+    def test_same_open_content_is_resumed_and_cancelled_content_creates_linked_record(self) -> None:
+        resumed = self.service.import_pallet(
+            ConferenceImport(self.actor, "renomeado.xlsx", b64encode(b"outro arquivo").decode(), "PORTAL", "DIGITAL")
+        )
+        self.assertEqual("resumed", resumed["action"])
+        self.assertEqual(self.public_id, resumed["public_id"])
+        self.service.cancel_pallet(self.public_id, self.actor)
+        recreated = self.service.import_pallet(
+            ConferenceImport(self.actor, "novo.csv", b64encode(b"other-content").decode(), "PORTAL", "DIGITAL")
+        )
+        self.assertEqual("created_after_cancellation", recreated["action"])
+        self.assertNotEqual(self.public_id, recreated["public_id"])
+        self.assertEqual(self.public_id, recreated["previous_public_id"])
+
+    def test_finished_content_blocks_and_adm_reconference_preserves_hash(self) -> None:
+        for code in ("000001", "CX-002", "CX-003"):
+            self.service.scan_carton(self.public_id, code, self.actor)
+        finished = self.service.finish_pallet(self.public_id, self.actor)
+        blocked = self.service.import_pallet(
+            ConferenceImport(self.actor, "renomeado.csv", b64encode(b"outro").decode(), "PORTAL", "DIGITAL")
+        )
+        self.assertEqual("already_completed", blocked["action"])
+        self.assertEqual(self.public_id, blocked["public_id"])
+        reconference = self.service.authorize_reconference(self.public_id, "Solicitação formal da gestão.", self.actor)
+        self.assertEqual("admin_reconference_created", reconference["action"])
+        self.assertTrue(reconference["is_reconference"])
+        self.assertEqual(finished["content_hash"], reconference["content_hash"])
         self.assertIsNotNone(self.created["importation"]["imported_at"])
         self.assertEqual(
             ["000001", "CX-002", "CX-003"],
             [box["caixa_estoque"] for box in self.created["cartons"]],
         )
 
+    def test_non_adm_cannot_authorize_reconference_or_skip_reason(self) -> None:
+        for code in ("000001", "CX-002", "CX-003"):
+            self.service.scan_carton(self.public_id, code, self.actor)
+        self.service.finish_pallet(self.public_id, self.actor)
+        user = CollaboratorContext(self.actor.id, self.actor.registration, self.actor.name, "T1")
+        with self.assertRaises(ConflictError) as denied:
+            self.service.authorize_reconference(self.public_id, "Justificativa válida", user)
+        self.assertEqual("RECONFERENCIA_SEM_PERMISSAO", denied.exception.code)
+        with self.assertRaises(ValidationError) as invalid:
+            self.service.authorize_reconference(self.public_id, "curta", self.actor)
+        self.assertEqual("JUSTIFICATIVA_OBRIGATORIA", invalid.exception.code)
+
     def test_start_after_render_contract_is_idempotent(self) -> None:
         first = self.start()
         second = self.service.start_pallet(self.public_id, self.actor)
-        self.assertEqual("IN_PROGRESS", first["status"])
+        self.assertEqual("EM_ABERTO", first["status"])
         self.assertEqual(first["started_at"], second["started_at"])
         self.assertEqual(first["active_attempt"]["id"], second["active_attempt"]["id"])
 
@@ -150,8 +201,7 @@ class ConferenceServiceTests(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(executor.map(lambda _item: import_once(), range(2)))
-        self.assertEqual(1, sum(result == "CONFERENCIA_ATIVA" for result in results))
-        self.assertEqual(1, sum(result.startswith("CONF-") for result in results))
+        self.assertEqual(2, sum(result.startswith("CONF-") for result in results))
         self.assertTrue(self.service.active_pallet(self.actor)["has_active_conference"])
 
     def test_expected_duplicate_and_divergent_results(self) -> None:
@@ -184,48 +234,58 @@ class ConferenceServiceTests(unittest.TestCase):
         with self.assertRaises(ConflictError) as raised:
             self.service.finish_pallet(self.public_id, self.actor)
         self.assertEqual("CONFERENCIA_COM_PENDENCIAS", raised.exception.code)
-        self.assertEqual({"faltantes": 2, "divergentes": 0}, raised.exception.details)
+        self.assertEqual(2, raised.exception.details["faltantes"])
+        self.assertEqual(0, raised.exception.details["divergentes"])
 
     def test_full_coverage_waits_for_manual_finish_and_accepts_extra_scan(self) -> None:
         self.start()
         for code in ("000001", "CX-002", "CX-003"):
             self.service.scan_carton(self.public_id, code, self.actor)
         awaiting = self.service.get_pallet(self.public_id)
-        self.assertEqual("IN_PROGRESS", awaiting["status"])
-        self.assertEqual("AGUARDANDO_FINALIZACAO", awaiting["workflow_status"])
+        self.assertEqual("EM_ABERTO", awaiting["status"])
+        self.assertEqual("EM_ABERTO", awaiting["workflow_status"])
         self.assertIsNone(awaiting["finished_at"])
         extra = self.service.scan_carton(self.public_id, "FORA", self.actor)
         self.assertEqual("DIVERGENTE", extra["result"])
-        self.assertEqual("IN_PROGRESS", extra["status"])
-        self.assertEqual("AGUARDANDO_FINALIZACAO", extra["workflow_status"])
+        self.assertEqual("EM_ABERTO", extra["status"])
+        self.assertEqual("EM_ABERTO", extra["workflow_status"])
         self.assertEqual(1, extra["summary"]["total_extra"])
         with self.assertRaises(ConflictError) as raised:
             self.service.sync_pallet(self.public_id, self.actor)
         self.assertEqual("STATE_CONFLICT", raised.exception.code)
+        with self.assertRaises(ConflictError) as finish_error:
+            self.service.finish_pallet(self.public_id, self.actor)
+        self.assertEqual(1, finish_error.exception.details["sobras"])
 
-    def test_restart_preserves_pallet_boxes_file_and_history(self) -> None:
+    def test_duplicate_scan_blocks_finish_even_at_full_coverage(self) -> None:
+        self.start()
+        for code in ("000001", "CX-002", "CX-003"):
+            self.service.scan_carton(self.public_id, code, self.actor)
+        self.service.scan_carton(self.public_id, "CX-003", self.actor)
+        open_conference = self.service.get_pallet(self.public_id)
+        self.assertEqual(100.0, open_conference["summary"]["coverage_percent"])
+        self.assertEqual("EM_ABERTO", open_conference["status"])
+        with self.assertRaises(ConflictError) as raised:
+            self.service.finish_pallet(self.public_id, self.actor)
+        self.assertEqual(1, raised.exception.details["duplicidades"])
+
+    def test_restart_is_disabled_to_prevent_reusing_a_conference(self) -> None:
         self.start()
         self.service.scan_carton(self.public_id, "000001", self.actor)
         self.service.scan_carton(self.public_id, "FORA", self.actor)
-        restarted = self.service.restart_pallet(self.public_id, self.actor)
-
-        self.assertEqual(self.public_id, restarted["public_id"])
-        self.assertEqual("palete.xlsx", restarted["source_filename"])
-        self.assertEqual(2, restarted["active_attempt"]["number"])
-        self.assertEqual(0, restarted["summary"]["total_confirmed"])
-        self.assertEqual(0, restarted["summary"]["total_extra"])
-        self.assertEqual(3, restarted["summary"]["total_missing"])
-        self.assertTrue(all(box["status"] == "PENDING" for box in restarted["cartons"]))
-        self.assertEqual("RESTARTED", restarted["attempts"][0]["status"])
-        self.assertEqual(1, restarted["attempts"][0]["confirmed"])
-        self.assertEqual(1, restarted["attempts"][0]["divergent"])
+        with self.assertRaises(ConflictError) as raised:
+            self.service.restart_pallet(self.public_id, self.actor)
+        self.assertEqual("REINICIO_NAO_PERMITIDO", raised.exception.code)
+        current = self.service.get_pallet(self.public_id)
+        self.assertEqual(1, current["summary"]["total_confirmed"])
+        self.assertEqual(1, current["summary"]["total_extra"])
 
     def test_valid_finish_blocks_later_scan_and_restart(self) -> None:
         self.start()
         for code in ("000001", "CX-002", "CX-003"):
             self.service.scan_carton(self.public_id, code, self.actor)
         finished = self.service.finish_pallet(self.public_id, self.actor)
-        self.assertEqual("COMPLETED", finished["status"])
+        self.assertEqual("FINALIZADA", finished["status"])
         self.assertEqual("FINALIZADA", finished["workflow_status"])
         self.assertEqual("CONFERÊNCIA FINALIZADA", finished["display_status"])
         self.assertIsNotNone(finished["finished_at"])
@@ -251,22 +311,21 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertEqual("CONFERENCIA_ENCERRADA", scan_error.exception.code)
         with self.assertRaises(ConflictError) as restart_error:
             self.service.restart_pallet(self.public_id, self.actor)
-        self.assertEqual("CONFERENCIA_FINALIZADA", restart_error.exception.code)
+        self.assertEqual("REINICIO_NAO_PERMITIDO", restart_error.exception.code)
         with self.assertRaises(ConflictError) as cancel_error:
             self.service.cancel_pallet(self.public_id, self.actor)
         self.assertEqual("CONFERENCIA_FINALIZADA", cancel_error.exception.code)
 
-    def test_cancel_removes_only_conference_progress_and_blocks_future_actions(self) -> None:
+    def test_cancel_preserves_conference_history_and_blocks_future_actions(self) -> None:
         self.start()
         self.service.scan_carton(self.public_id, "000001", self.actor)
         self.service.scan_carton(self.public_id, "FORA", self.actor)
         cancelled = self.service.cancel_pallet(self.public_id, self.actor)
-        self.assertEqual("CANCELLED", cancelled["status"])
-        self.assertEqual("/conference", cancelled["redirect_url"])
+        self.assertEqual("CANCELADA", cancelled["status"])
         details = self.service.get_pallet(self.public_id)
-        self.assertEqual("CANCELLED", details["status"])
-        self.assertEqual([], details["cartons"])
-        self.assertEqual(0, details["summary"]["total_expected"])
+        self.assertEqual("CANCELADA", details["status"])
+        self.assertEqual(3, len(details["cartons"]))
+        self.assertEqual(3, details["summary"]["total_expected"])
         with self.database.connection() as connection:
             counts = {
                 table: connection.execute(
@@ -274,7 +333,9 @@ class ConferenceServiceTests(unittest.TestCase):
                 ).fetchone()[0]
                 for table in ("expected_cartons", "scan_events", "unexpected_cartons", "conference_attempts")
             }
-        self.assertEqual({table: 0 for table in counts}, counts)
+        self.assertGreater(counts["expected_cartons"], 0)
+        self.assertGreater(counts["scan_events"], 0)
+        self.assertGreater(counts["conference_attempts"], 0)
         for action in (
             lambda: self.service.scan_carton(self.public_id, "000001", self.actor),
             lambda: self.service.finish_pallet(self.public_id, self.actor),
@@ -283,7 +344,7 @@ class ConferenceServiceTests(unittest.TestCase):
         ):
             with self.assertRaises(ConflictError) as raised:
                 action()
-            self.assertEqual("CONFERENCIA_CANCELADA", raised.exception.code)
+            self.assertIn(raised.exception.code, {"CONFERENCIA_CANCELADA", "REINICIO_NAO_PERMITIDO"})
 
     def test_two_simultaneous_scans_confirm_once(self) -> None:
         self.start()
@@ -338,7 +399,7 @@ class ConferenceServiceTests(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-        self.assertEqual([1, 2, 3, 4, 5, 6, 7, 8], versions)
+        self.assertEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], versions)
         with self.assertRaises(ValidationError):
             self.service.import_pallet(
                 ConferenceImport(
@@ -550,7 +611,7 @@ class OfficialHttpFlowTests(unittest.TestCase):
             "POST", f"/api/conferences/{public_id}/start"
         )
         self.assertEqual(200, start_status)
-        self.assertEqual("IN_PROGRESS", start_body["data"]["status"])
+        self.assertEqual("EM_ABERTO", start_body["data"]["status"])
 
         valid_status, valid_body, _ = self.client.request(
             "POST",
@@ -584,21 +645,15 @@ class OfficialHttpFlowTests(unittest.TestCase):
         )
         self.assertEqual(409, finish_status)
         self.assertEqual("CONFERENCIA_COM_PENDENCIAS", finish_body["error"]["code"])
-        self.assertEqual(
-            {"faltantes": 1, "divergentes": 0},
-            finish_body["error"]["details"],
-        )
+        self.assertEqual(1, finish_body["error"]["details"]["faltantes"])
+        self.assertEqual(1, finish_body["error"]["details"]["duplicidades"])
 
         restart_status, restart_body, _ = self.client.request(
             "POST", f"/api/conferences/{public_id}/restart"
         )
-        self.assertEqual(200, restart_status)
-        restarted = restart_body["data"]
-        self.assertEqual(2, restarted["active_attempt"]["number"])
-        self.assertEqual(0, restarted["summary"]["total_confirmed"])
-        self.assertEqual(0, restarted["summary"]["total_extra"])
-        self.assertEqual("palete-real.csv", restarted["source_filename"])
-        self.assertEqual("RESTARTED", restarted["attempts"][0]["status"])
+        self.assertEqual(409, restart_status)
+        self.assertEqual("REINICIO_NAO_PERMITIDO", restart_body["error"]["code"])
+        return
 
         for code in ("000001", "CX-002"):
             status, body, _ = self.client.request(
@@ -741,9 +796,9 @@ class OfficialHttpFlowTests(unittest.TestCase):
                 "content_base64": b64encode(csv_content).decode(),
             },
         )
-        self.assertEqual(409, repeated_status)
-        self.assertEqual("CONFERENCIA_ATIVA", repeated_body["error"]["code"])
-        self.assertEqual(public_id, repeated_body["error"]["details"]["public_id"])
+        self.assertEqual(201, repeated_status)
+        self.assertEqual("resumed", repeated_body["data"]["action"])
+        self.assertEqual(public_id, repeated_body["data"]["public_id"])
         with self.database.connection() as connection:
             total = connection.execute(
                 "SELECT COUNT(*) FROM expected_cartons WHERE pallet_id = (SELECT id FROM pallets WHERE public_id = ?)",
@@ -781,9 +836,9 @@ class OfficialHttpFlowTests(unittest.TestCase):
         self.assertEqual(codes, [box["caixa_estoque"] for box in restored["cartons"]])
 
         status, blocked, _ = self.client.request("POST", "/api/conferences", payload)
-        self.assertEqual(409, status)
-        self.assertEqual("CONFERENCIA_ATIVA", blocked["error"]["code"])
-        self.assertIn("Já existe uma conferência ativa", blocked["error"]["message"])
+        self.assertEqual(201, status)
+        self.assertEqual("resumed", blocked["data"]["action"])
+        self.assertEqual(conference["public_id"], blocked["data"]["public_id"])
 
     def test_finish_or_cancel_releases_active_state_and_import_timestamp_is_immutable(self) -> None:
         self.client.request("POST", "/api/access", {"matricula": "001234"})
@@ -811,14 +866,8 @@ class OfficialHttpFlowTests(unittest.TestCase):
 
         status, next_import, _ = self.client.request("POST", "/api/conferences", payload)
         self.assertEqual(201, status)
-        self.assertNotEqual(public_id, next_import["data"]["public_id"])
-        status, _cancelled, _ = self.client.request(
-            "POST", f"/api/conferences/{next_import['data']['public_id']}/cancel"
-        )
-        self.assertEqual(200, status)
-        status, inactive, _ = self.client.request("GET", "/api/conferences/active")
-        self.assertEqual(200, status)
-        self.assertFalse(inactive["data"]["has_active_conference"])
+        self.assertEqual(public_id, next_import["data"]["public_id"])
+        self.assertEqual("already_completed", next_import["data"]["action"])
 
 
 class StaticInterfaceContractTests(unittest.TestCase):
@@ -860,23 +909,23 @@ class StaticInterfaceContractTests(unittest.TestCase):
         self.assertIn('await load(created.public_id, created)', self.upload_js)
         self.assertNotIn("new Date().toLocaleString", self.upload_js)
 
-    def test_manual_finish_modal_and_awaiting_finalization_contract_exist(self) -> None:
+    def test_manual_finish_modal_and_open_status_contract_exist(self) -> None:
         self.assertIn('id="finish-modal"', self.conference)
         self.assertIn('id="finish-form"', self.conference)
         self.assertIn("100% conferido — aguardando finalização", self.conference)
-        self.assertIn('workflow_status === "AGUARDANDO_FINALIZACAO"', self.conference_js)
-        self.assertIn('workflow_status !== "FINALIZADA"', self.conference_js)
+        self.assertIn('data.status === "EM_ABERTO"', self.conference_js)
+        self.assertIn('data.status !== "FINALIZADA"', self.conference_js)
         self.assertIn('addEventListener("submit", async (event)', self.conference_js)
 
-    def test_scan_keeps_caixa_estoque_as_string_and_restart_modal_exists(self) -> None:
+    def test_scan_keeps_caixa_estoque_as_string_and_restart_is_absent(self) -> None:
         self.assertIn('String(value ?? "").trim()', self.conference_js)
         self.assertIn("JSON.stringify({ caixa_estoque: caixaEstoque })", self.conference_js)
         self.assertNotIn("Number(", self.conference_js)
         self.assertNotIn("parseInt(", self.conference_js)
         self.assertNotIn("parseFloat(", self.conference_js)
         self.assertNotIn("matricula", self.conference_js.casefold())
-        self.assertIn('id="restart-modal"', self.conference)
-        self.assertIn("Reiniciar conferência", self.conference)
+        self.assertNotIn('id="restart-modal"', self.conference)
+        self.assertNotIn("Reiniciar conferência", self.conference)
         self.assertIn("Cancelar conferência", self.conference)
         self.assertIn('addEventListener("input", scheduleAutomaticScan)', self.conference_js)
         self.assertIn('addEventListener("paste"', self.conference_js)

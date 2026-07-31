@@ -21,10 +21,10 @@ Abra `http://127.0.0.1:8080`.
 1. Identifique o colaborador pela matrícula na tela inicial. O cadastro rápido fica ao lado de `Acessar`.
 2. Na tela seguinte, selecione somente o arquivo `.xlsx` ou `.csv`. A matrícula vem da sessão e não faz parte do upload.
 3. O arquivo deve ter a coluna `CAIXA_ESTOQUE` ou uma variação aceita do cabeçalho. O limite padrão é 10 MB.
-4. A conferência nasce em `READY`, sem horário inicial. Depois de renderizar todas as caixas, o navegador chama o início idempotente.
+4. Cada upload cria uma conferência independente em `EM_ABERTO` e inicia seu cronômetro. Enquanto ela estiver aberta, o backend e a tela bloqueiam nova importação para o mesmo colaborador.
 5. Uma caixa esperada fica verde e `CONFERIDA`; uma não esperada fica vermelha e `DIVERGENTE`; repetição fica `DUPLICADA` sem alterar os totais.
-6. A finalização é permitida somente sem faltantes e sem divergentes.
-7. O reinício encerra a tentativa atual, preserva o histórico e cria uma nova tentativa com o mesmo palete, arquivo e caixas esperadas.
+6. Atingir 100% não finaliza automaticamente. A finalização explícita só é permitida sem faltantes, divergências, sobras ou duplicidades.
+7. `FINALIZADA` e `CANCELADA` preservam caixas e eventos no histórico. Não há reinício ou reaproveitamento do mesmo palete; uma nova importação sempre gera outro identificador.
 
 ## Testes
 
@@ -44,8 +44,8 @@ py -m unittest discover -s tests -v
 | `POST` | `/api/conferences` | Importa `.xlsx` ou `.csv` em Base64/JSON |
 | `GET` | `/api/conferences/{public_id}` | Consulta a conferência |
 | `GET` | `/api/conferences/{public_id}/boxes` | Consulta as caixas esperadas |
-| `POST` | `/api/conferences/{public_id}/start` | Início idempotente |
+| `POST` | `/api/conferences/{public_id}/start` | Compatibilidade idempotente; não reinicia o cronômetro |
 | `POST` | `/api/conferences/{public_id}/scan` | Registra uma bipagem |
 | `POST` | `/api/conferences/{public_id}/finish` | Finaliza sem pendências |
-| `POST` | `/api/conferences/{public_id}/restart` | Cria nova tentativa |
+| `POST` | `/api/conferences/{public_id}/cancel` | Cancela e preserva o histórico |
 | `POST` | `/api/conferences/{public_id}/sync` | Registra tentativa de sincronização |

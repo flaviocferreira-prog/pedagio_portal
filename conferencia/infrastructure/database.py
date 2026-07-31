@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from conferencia.domain.box_codes import content_hash_caixa_estoque
+
 
 class SQLiteDatabase:
     """Conexões SQLite e migrações incrementais, sem reset destrutivo."""
@@ -79,6 +81,12 @@ class SQLiteDatabase:
             if 8 not in applied:
                 self._migration_008_estado_ativo_e_horario_importacao(connection)
                 self._record(connection, 8, "estado ativo por colaborador e horario UTC da importacao")
+            if 9 not in applied:
+                self._migration_009_ciclo_fechado_por_conferencia(connection)
+                self._record(connection, 9, "ciclo fechado por conferencia e historico preservado")
+            if 10 not in applied:
+                self._migration_010_assinatura_e_auditoria_de_palete(connection)
+                self._record(connection, 10, "assinatura de conteudo, reconferencia e auditoria")
             violations = connection.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise RuntimeError("A migração de caixa estoque violou chaves estrangeiras.")
@@ -508,6 +516,121 @@ class SQLiteDatabase:
             SET imported_at = REPLACE(imported_at, ' ', 'T') || 'Z'
             WHERE imported_at IS NOT NULL
               AND INSTR(imported_at, 'T') = 0
+            """
+        )
+
+    @staticmethod
+    def _migration_009_ciclo_fechado_por_conferencia(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Adiciona o estado oficial sem apagar o histórico legado.
+
+        A coluna ``status`` antiga possuía um CHECK incompatível com os nomes
+        operacionais. ``conference_status`` passa a ser a fonte canônica e o
+        status legado continua somente para compatibilidade da base existente.
+        """
+        SQLiteDatabase._add_column_if_missing(
+            connection, "pallets", "conference_status", "TEXT"
+        )
+        SQLiteDatabase._add_column_if_missing(
+            connection, "pallets", "productivity_boxes_per_hour", "REAL"
+        )
+        SQLiteDatabase._add_column_if_missing(
+            connection, "pallets", "print_status", "TEXT NOT NULL DEFAULT 'AVAILABLE'"
+        )
+        connection.execute(
+            """
+            UPDATE pallets
+            SET conference_status = CASE
+                WHEN cancelled_at IS NOT NULL THEN 'CANCELADA'
+                WHEN status = 'COMPLETED' THEN 'FINALIZADA'
+                ELSE 'EM_ABERTO'
+            END
+            WHERE conference_status IS NULL
+            """
+        )
+
+    @staticmethod
+    def _migration_010_assinatura_e_auditoria_de_palete(
+        connection: sqlite3.Connection,
+    ) -> None:
+        for column, definition in (
+            ("content_hash", "TEXT"),
+            ("previous_conference_id", "INTEGER REFERENCES pallets(id)"),
+            ("is_reconference", "INTEGER NOT NULL DEFAULT 0 CHECK(is_reconference IN (0, 1))"),
+            ("reconference_authorized_by", "INTEGER REFERENCES colaboradores(id)"),
+            ("reconference_reason", "TEXT"),
+            ("reconference_authorized_at", "TEXT"),
+        ):
+            SQLiteDatabase._add_column_if_missing(connection, "pallets", column, definition)
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS conference_audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pallet_id INTEGER REFERENCES pallets(id) ON DELETE RESTRICT,
+                collaborator_id INTEGER REFERENCES colaboradores(id) ON DELETE SET NULL,
+                registration TEXT,
+                profile TEXT,
+                ip_address TEXT,
+                action TEXT NOT NULL,
+                content_hash TEXT,
+                justification TEXT,
+                result TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_pallets_content_hash ON pallets(content_hash, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_content_hash ON conference_audit_events(content_hash, id DESC);
+            """
+        )
+        pallets = connection.execute(
+            "SELECT id FROM pallets WHERE content_hash IS NULL"
+        ).fetchall()
+        for pallet in pallets:
+            codes = [
+                row["code"]
+                for row in connection.execute(
+                    "SELECT code FROM expected_cartons WHERE pallet_id = ? ORDER BY id",
+                    (pallet["id"],),
+                )
+            ]
+            if codes:
+                connection.execute(
+                    "UPDATE pallets SET content_hash = ? WHERE id = ?",
+                    (content_hash_caixa_estoque(codes), pallet["id"]),
+                )
+        connection.execute(
+            """
+            UPDATE pallets
+            SET status = 'IN_PROGRESS',
+                started_at = COALESCE(started_at, imported_at),
+                updated_at = COALESCE(updated_at, imported_at)
+            WHERE conference_status = 'EM_ABERTO' AND status = 'READY'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE conference_attempts
+            SET status = 'IN_PROGRESS',
+                started_at = COALESCE(started_at, (
+                    SELECT p.started_at FROM pallets p WHERE p.id = conference_attempts.pallet_id
+                ))
+            WHERE status = 'READY'
+              AND EXISTS (
+                  SELECT 1 FROM pallets p
+                  WHERE p.id = conference_attempts.pallet_id
+                    AND p.conference_status = 'EM_ABERTO'
+              )
+            """
+        )
+        # Um fingerprint global impedia reimportar legitimamente um arquivo
+        # depois do encerramento. A unicidade de conferência aberta abaixo e a
+        # transação de criação são a proteção correta contra duplo clique.
+        connection.execute("DROP INDEX IF EXISTS idx_pallets_source_fingerprint")
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_conference_per_collaborator
+            ON pallets(created_by_collaborator_id)
+            WHERE conference_status = 'EM_ABERTO'
             """
         )
         connection.execute(

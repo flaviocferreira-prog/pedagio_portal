@@ -30,7 +30,7 @@ export function startTimer(conference) {
     output.textContent = formatDuration(elapsed);
   };
   tick();
-  if (conference.status === "IN_PROGRESS") {
+  if (conference.status === "EM_ABERTO") {
     timerHandle = window.setInterval(tick, 1000);
   }
 }

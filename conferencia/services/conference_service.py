@@ -8,7 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
-from conferencia.domain.box_codes import normalize_caixa_estoque
+from conferencia.domain.box_codes import content_hash_caixa_estoque, normalize_caixa_estoque
 from conferencia.domain.entities import (
     CollaboratorContext,
     ConferenceImport,
@@ -100,15 +100,14 @@ class ConferenceService:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
         carton_codes = [normalize_caixa_estoque(code) for code in carton_codes]
-        if not all(carton_codes):
-            raise ValidationError("Há uma caixa estoque vazia no arquivo.")
-        active = self.repository.find_active_by_collaborator(collaborator.id)
-        if active is not None:
-            raise self._active_conference_error(active["public_id"])
+        carton_codes = [code for code in carton_codes if code]
+        if not carton_codes:
+            raise ValidationError("O arquivo não possui caixas estoque válidas.")
+        content_hash = content_hash_caixa_estoque(carton_codes)
         source_fingerprint = sha256(content + f"|{origin}|{operation}".encode()).hexdigest()
         public_id = f"CONF-{uuid4().hex[:12].upper()}"
         try:
-            self.repository.create(
+            decision = self.repository.create(
                 public_id,
                 collaborator,
                 import_data.filename,
@@ -117,6 +116,7 @@ class ConferenceService:
                 origin,
                 operation,
                 collaborator.shift,
+                content_hash,
             )
         except ActiveConferenceError as error:
             raise self._active_conference_error(error.public_id) from error
@@ -125,13 +125,41 @@ class ConferenceService:
                 "Não foi possível criar a conferência sem duplicidades.",
                 code="CONFERENCE_CREATION_CONFLICT",
             ) from error
-        result = self.get_pallet(public_id)
+        result = self.get_pallet(str(decision["public_id"]))
+        action = str(decision["action"])
+        if action == "already_completed":
+            owner = result["collaborator"]
+            result.update({
+                "action": action,
+                "message": (
+                    "Conferência já realizada. Este palete já foi conferido anteriormente e não pode ser iniciado novamente. "
+                    f"Conferente: {owner['name']}. Matrícula: {owner['registration']}. "
+                    f"Finalizado em: {result['finalization']['finished_at']}. "
+                    f"Total conferido: {result['summary']['total_confirmed']} caixas."
+                ),
+                "can_authorize_reconference": collaborator.shift == "ADM",
+            })
+            return result
+        if action == "resumed":
+            owner = result["collaborator"]
+            result.update({
+                "action": action,
+                "message": (
+                    "Conferência já em andamento. Este palete já possui uma conferência aberta. "
+                    f"Iniciado por: {owner['name']}. Matrícula: {owner['registration']}. "
+                    f"Iniciado em: {result['importation']['imported_at']}. O progresso existente foi carregado."
+                ),
+            })
+            return result
         return self._import_response(
             result,
             total_lines=len(carton_codes),
             total_imported=len(carton_codes),
             total_duplicates=0,
-            message="Arquivo importado com sucesso.",
+            message=("Nova conferência criada a partir de conteúdo anteriormente cancelado." if action == "created_after_cancellation" else "Nova conferência criada com sucesso."),
+            action=action,
+            content_hash=content_hash,
+            previous_public_id=decision.get("previous_public_id"),
         )
 
     def active_pallet(self, collaborator: CollaboratorContext) -> dict:
@@ -152,6 +180,33 @@ class ConferenceService:
             "latest_conference": None,
         }
 
+    def authorize_reconference(
+        self, public_id: str, reason: object, collaborator: CollaboratorContext
+    ) -> dict:
+        actor = self._validate_collaborator(collaborator)
+        if actor.shift != "ADM":
+            self.repository.record_audit_for_public_id(public_id, actor, "RECONFERENCIA_SEM_PERMISSAO", "BLOCKED")
+            raise ConflictError("Somente usuários ADM podem autorizar reconferência.", code="RECONFERENCIA_SEM_PERMISSAO")
+        justification = reason.strip() if isinstance(reason, str) else ""
+        if len(justification) < 10:
+            self.repository.record_audit_for_public_id(public_id, actor, "RECONFERENCIA_SEM_JUSTIFICATIVA", "BLOCKED")
+            raise ValidationError("Informe uma justificativa de pelo menos 10 caracteres.", code="JUSTIFICATIVA_OBRIGATORIA")
+        previous = self._find(public_id)
+        new_id = f"CONF-{uuid4().hex[:12].upper()}"
+        try:
+            self.repository.create_reconference(previous["public_id"], new_id, actor, justification)
+        except ActiveConferenceError as error:
+            raise self._active_conference_error(error.public_id) from error
+        except RepositoryStateError as error:
+            self._raise_state_error(error, action="reconference")
+        result = self.get_pallet(new_id)
+        result.update({
+            "action": "admin_reconference_created",
+            "message": "Reconferência autorizada e criada com sucesso.",
+            "previous_public_id": previous["public_id"],
+        })
+        return result
+
     @staticmethod
     def _import_response(
         result: dict,
@@ -160,6 +215,9 @@ class ConferenceService:
         total_imported: int,
         total_duplicates: int,
         message: str,
+        action: str = "created",
+        content_hash: str | None = None,
+        previous_public_id: object = None,
     ) -> dict:
         """Expõe a lista já confirmada no banco e os totais do upload."""
         result.update(
@@ -170,6 +228,9 @@ class ConferenceService:
                 "total_importadas": total_imported,
                 "total_duplicadas": total_duplicates,
                 "caixas": result["cartons"],
+                "action": action,
+                "content_hash": content_hash or result.get("content_hash"),
+                "previous_public_id": previous_public_id,
             }
         )
         return result
@@ -230,9 +291,9 @@ class ConferenceService:
     ) -> dict:
         actor = self._validate_collaborator(collaborator)
         pallet = self._find(public_id)
-        if pallet["cancelled_at"] is not None:
+        if pallet["conference_status"] == "CANCELADA":
             self._raise_state_error(RepositoryStateError("CANCELLED"), action="finish")
-        if pallet["status"] == "COMPLETED":
+        if pallet["conference_status"] == "FINALIZADA":
             result = self.get_pallet(pallet["public_id"])
             result["message"] = "A conferência já está finalizada."
             return result
@@ -245,6 +306,8 @@ class ConferenceService:
                 details={
                     "faltantes": error.missing,
                     "divergentes": error.divergent,
+                    "sobras": error.extra,
+                    "duplicidades": error.duplicate,
                 },
             ) from error
         except RepositoryStateError as error:
@@ -256,6 +319,11 @@ class ConferenceService:
     def restart_pallet(
         self, public_id: str, collaborator: CollaboratorContext
     ) -> dict:
+        self._validate_collaborator(collaborator)
+        raise ConflictError(
+            "O reinÃ­cio foi removido para preservar a conferÃªncia. Cancele-a e importe uma nova planilha.",
+            code="REINICIO_NAO_PERMITIDO",
+        )
         actor = self._validate_collaborator(collaborator)
         pallet = self._find(public_id)
         try:
@@ -275,6 +343,9 @@ class ConferenceService:
             self.repository.cancel(pallet["id"], actor)
         except RepositoryStateError as error:
             self._raise_state_error(error, action="cancel")
+        result = self.get_pallet(pallet["public_id"])
+        result["message"] = "ConferÃªncia cancelada. O histÃ³rico foi preservado e uma nova importaÃ§Ã£o estÃ¡ liberada."
+        return result
         return {
             "public_id": pallet["public_id"],
             "status": "CANCELLED",
@@ -338,6 +409,11 @@ class ConferenceService:
             raise ConflictError(
                 "Esta conferência foi cancelada e exige um novo upload.",
                 code="CONFERENCIA_CANCELADA",
+            ) from error
+        if error.state == "RESTART_DISABLED":
+            raise ConflictError(
+                "O reinÃ­cio foi removido para preservar a conferÃªncia.",
+                code="REINICIO_NAO_PERMITIDO",
             ) from error
         if action == "restart" and error.state == "FINISHED":
             raise ConflictError(

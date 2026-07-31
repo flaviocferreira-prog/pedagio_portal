@@ -125,6 +125,9 @@ class ApplicationHandler(BaseHTTPRequestHandler):
             "restart": lambda: self.controller.restart_pallet(
                 public_id, collaborator
             ),
+            "reconference": lambda: self.controller.authorize_reconference(
+                public_id, payload, collaborator
+            ),
             "sync": lambda: self.controller.sync_pallet(public_id, collaborator),
             "cancel": lambda: self.controller.cancel_pallet(public_id, collaborator),
         }

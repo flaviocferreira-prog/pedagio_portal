@@ -9,6 +9,14 @@ class CartonStatus(StrEnum):
     CONFIRMED = "CONFIRMED"
 
 
+class ConferenceStatus(StrEnum):
+    """Estados oficiais e imutáveis do ciclo de uma conferência."""
+
+    OPEN = "EM_ABERTO"
+    FINISHED = "FINALIZADA"
+    CANCELLED = "CANCELADA"
+
+
 class ScanClassification(StrEnum):
     MATCHED = "MATCHED"
     DUPLICATE = "DUPLICATE"

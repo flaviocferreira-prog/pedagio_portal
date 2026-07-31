@@ -71,6 +71,11 @@ class ConferenceController:
     ) -> dict:
         return self.service.restart_pallet(public_id, collaborator)
 
+    def authorize_reconference(
+        self, public_id: str, payload: dict[str, object], collaborator: CollaboratorContext
+    ) -> dict:
+        return self.service.authorize_reconference(public_id, payload.get("justificativa"), collaborator)
+
     def sync_pallet(
         self, public_id: str, collaborator: CollaboratorContext
     ) -> dict:
