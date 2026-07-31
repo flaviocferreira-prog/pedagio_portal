@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sistema de Conferência</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <main class="access-layout">
+        <section class="card access-card">
+            <p class="eyebrow">OPERAÇÃO LOGÍSTICA</p>
+            <h1>Sistema de Conferência</h1>
+            <p class="helper">Informe sua matrícula para continuar.</p>
+            <div id="notice" class="notice" aria-live="polite"></div>
+            <form id="access-form" class="access-form">
+                <label for="matricula">
+                    Matrícula
+                    <input id="matricula" name="matricula" inputmode="numeric"
+                           autocomplete="off" autofocus required>
+                </label>
+                <div class="access-actions">
+                    <button id="btn-acessar" type="submit">Acessar</button>
+                    <button class="icon-button" type="button"
+                            id="btn-abrir-cadastro-colaborador"
+                            aria-label="Cadastrar colaborador"
+                            title="Cadastrar colaborador">
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M15 12a4 4 0 1 0-6 0c-3 .8-5 3.1-5 6v1h12v-1c0-2.9-2-5.2-5-6Zm4-5v3h-3v2h3v3h2v-3h3v-2h-3V7Z"/>
+                        </svg>
+                    </button>
+                    <button class="icon-button" type="button"
+                            id="btn-editar-colaborador"
+                            aria-label="Editar colaborador"
+                            title="Editar colaborador">✎</button>
+                </div>
+            </form>
+        </section>
+
+        <dialog id="cadastro-modal" aria-labelledby="cadastro-title">
+            <form id="cadastro-form" method="dialog">
+                <div class="dialog-heading">
+                    <div>
+                        <p class="eyebrow">CADASTRO RÁPIDO</p>
+                        <h2 id="cadastro-title">Cadastrar colaborador</h2>
+                    </div>
+                    <button id="fechar-modal" class="close-button" type="button"
+                            aria-label="Fechar">×</button>
+                </div>
+                <div id="cadastro-msg" class="notice" aria-live="polite"></div>
+                <label for="cadastro-matricula">
+                    Matrícula
+                    <input id="cadastro-matricula" name="matricula"
+                           inputmode="numeric" autocomplete="off" required>
+                </label>
+                <label for="cadastro-nome">
+                    Nome
+                    <input id="cadastro-nome" name="nome"
+                           autocomplete="off" required>
+                </label>
+                <label for="cadastro-turno">
+                    Turno
+                    <select id="cadastro-turno" name="turno" required>
+                        <option value="">Selecione o turno</option>
+                        <option value="T1">T1</option>
+                        <option value="T2">T2</option>
+                        <option value="T3">T3</option>
+                        <option value="ADM">ADM</option>
+                    </select>
+                </label>
+                <div class="dialog-actions">
+                    <button class="secondary" type="button" id="cancelar">Cancelar</button>
+                    <button type="submit" id="cadastrar">Cadastrar</button>
+                </div>
+            </form>
+        </dialog>
+    </main>
+    <script type="module" src="/static/js/access.js"></script>
+</body>
+</html>

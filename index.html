@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Conferência de Volumetria</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <main class="layout">
+        <header class="page-header">
+            <div>
+                <p class="eyebrow">CONFERÊNCIA FÍSICA</p>
+                <h1>Conferência de Volumetria</h1>
+            </div>
+            <button id="logout-button" class="secondary" type="button">Trocar colaborador</button>
+        </header>
+
+        <div id="notice" class="notice" aria-live="polite"></div>
+
+        <section id="upload-card" class="card" hidden>
+            <button id="new-import-button" type="button">Nova importação</button>
+        </section>
+
+        <section id="conference" class="card" hidden>
+            <div class="conference-heading">
+                <div>
+                    <p class="eyebrow">PALETE ATIVO</p>
+                    <h2 id="summary-id"></h2>
+                    <p id="summary-file" class="helper"></p>
+                </div>
+                <span id="summary-status" class="status-badge"></span>
+            </div>
+
+            <div class="identity-row">
+                <span>Colaborador <strong id="summary-collaborator"></strong></span>
+                <span>Tentativa <strong id="summary-attempt"></strong></span>
+                <span>Tempo <strong id="summary-timer">00:00:00</strong></span>
+            </div>
+            <div class="identity-row import-metadata">
+                <span>Origem <strong id="summary-origin"></strong></span>
+                <span>Operação <strong id="summary-operation"></strong></span>
+                <span>Turno <strong id="summary-shift"></strong></span>
+                <span>Importado em <strong id="summary-imported-at"></strong></span>
+                <span id="summary-finalized-wrap" hidden>Finalizada em <strong id="summary-finalized-at"></strong></span>
+            </div>
+
+            <div class="summary">
+                <article><span>Esperadas</span><strong id="summary-expected">0</strong></article>
+                <article><span>Conferidas</span><strong id="summary-confirmed">0</strong></article>
+                <article><span>Faltantes</span><strong id="summary-pending">0</strong></article>
+                <article class="danger-card"><span>Divergentes</span><strong id="summary-surplus">0</strong></article>
+                <article><span>Duplicadas</span><strong id="summary-duplicate">0</strong></article>
+                <article><span>Percentual</span><strong id="summary-coverage">0%</strong></article>
+            </div>
+
+            <progress id="progress" value="0" max="100" aria-label="Progresso da conferência"></progress>
+
+            <form id="carton-form" class="scan-form">
+                <label for="carton-code">
+                    Bipar caixa
+                    <input id="carton-code" autocomplete="off" required
+                           aria-describedby="scan-helper">
+                </label>
+                <button type="submit">Ler caixa</button>
+            </form>
+            <p id="scan-helper" class="helper">Bipe ou cole o código; a conferência é automática.</p>
+            <p id="completion-notice" class="notice warning" hidden>100% conferido — aguardando finalização</p>
+
+            <div class="conference-actions">
+                <button id="finish-button" type="button">Finalizar conferência</button>
+                <button id="restart-button" class="danger-outline" type="button">Reiniciar conferência</button>
+                <button id="cancel-conference-button" class="danger-button" type="button">Cancelar conferência</button>
+                <button id="sync-button" class="secondary" type="button" hidden>Sincronizar</button>
+            </div>
+
+            <div class="lists-grid">
+                <section>
+                    <div class="list-heading">
+                        <h3>Caixas esperadas</h3>
+                        <span id="box-count"></span>
+                    </div>
+                    <ul id="carton-list" class="box-list"></ul>
+                </section>
+                <section class="extra-panel">
+                    <div class="list-heading">
+                        <h3>Divergências</h3>
+                        <span id="extra-count"></span>
+                    </div>
+                    <ul id="extra-list" class="extra-list"></ul>
+                </section>
+            </div>
+        </section>
+
+        <dialog id="restart-modal" aria-labelledby="restart-title">
+            <form id="restart-form" method="dialog">
+                <h2 id="restart-title">Reiniciar conferência</h2>
+                <p>Tem certeza de que deseja reiniciar esta conferência?</p>
+                <p class="helper">As bipagens e divergências da tentativa atual serão zeradas. O palete e as caixas esperadas serão mantidos.</p>
+                <div class="dialog-actions">
+                    <button id="restart-cancel" class="secondary" type="button">Cancelar</button>
+                    <button id="restart-confirm" class="danger-button" type="submit">Reiniciar</button>
+                </div>
+            </form>
+        </dialog>
+        <dialog id="finish-modal" aria-labelledby="finish-title">
+            <form id="finish-form" method="dialog">
+                <h2 id="finish-title">Finalizar conferência</h2>
+                <p>Tem certeza de que deseja finalizar esta conferência? Após finalizar, não será possível bipar, cancelar ou alterar os dados.</p>
+                <div class="dialog-actions">
+                    <button id="finish-cancel" class="secondary" type="button">Voltar</button>
+                    <button id="finish-confirm" type="submit">Confirmar finalização</button>
+                </div>
+            </form>
+        </dialog>
+        <dialog id="import-modal" aria-labelledby="import-title">
+            <form id="import-form" method="dialog">
+                <div class="dialog-heading"><h2 id="import-title">Nova importação</h2><button id="import-close" class="close-button" type="button" aria-label="Fechar">×</button></div>
+                <p class="helper">1. Selecione a origem</p>
+                <div class="choice-grid" role="radiogroup" aria-label="Origem">
+                    <button type="button" class="choice-button" data-origin="PORTAL">Portal</button>
+                    <button type="button" class="choice-button" data-origin="TL">TL</button>
+                </div>
+                <p class="helper">2. Selecione a operação</p>
+                <div id="operation-choices" class="choice-grid" role="radiogroup" aria-label="Operação" aria-disabled="true">
+                    <button type="button" class="choice-button" data-operation="DIGITAL" disabled>Digital</button>
+                    <button type="button" class="choice-button" data-operation="NIKESTORE" disabled>Nike Store</button>
+                    <button type="button" class="choice-button" data-operation="CROSS" disabled>Cross</button>
+                </div>
+                <label for="pallet-file">3. Arquivo<input id="pallet-file" name="file" type="file" accept=".xlsx,.csv" disabled required></label>
+                <div id="import-dropzone" class="dropzone" tabindex="0">Arraste o arquivo aqui ou use o seletor acima.</div>
+                <p id="import-summary" class="helper">Preencha origem, operação e arquivo para revisar a importação.</p>
+                <div class="dialog-actions"><button id="import-confirm" type="submit" disabled>Importar e iniciar conferência</button></div>
+            </form>
+        </dialog>
+        <dialog id="cancel-conference-modal" aria-labelledby="cancel-conference-title">
+            <form id="cancel-conference-form" method="dialog">
+                <h2 id="cancel-conference-title">Cancelar conferência</h2>
+                <p>Todo o progresso e as caixas importadas desta conferência serão apagados.</p>
+                <p class="helper">Será necessário importar o arquivo novamente para iniciar outra conferência.</p>
+                <div class="dialog-actions">
+                    <button id="cancel-conference-dismiss" class="secondary" type="button">Voltar</button>
+                    <button id="cancel-conference-confirm" class="danger-button" type="submit">Confirmar cancelamento</button>
+                </div>
+            </form>
+        </dialog>
+    </main>
+    <script type="module" src="/static/js/main.js"></script>
+</body>
+</html>
