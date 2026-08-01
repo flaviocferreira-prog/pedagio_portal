@@ -103,7 +103,10 @@ class ConferenceService:
         carton_codes = [code for code in carton_codes if code]
         if not carton_codes:
             raise ValidationError("O arquivo não possui caixas estoque válidas.")
-        content_hash = content_hash_caixa_estoque(carton_codes)
+        # Signature comes solely from the textual CAIXA_ESTOQUE multiset;
+        # filename, physical bytes, line order and workstation do not affect it.
+        fingerprint = getattr(self.excel_reader, "fingerprint", content_hash_caixa_estoque)
+        content_hash = fingerprint(carton_codes)
         source_fingerprint = sha256(content + f"|{origin}|{operation}".encode()).hexdigest()
         public_id = f"CONF-{uuid4().hex[:12].upper()}"
         try:
@@ -167,12 +170,14 @@ class ConferenceService:
         active = self.repository.find_active_by_collaborator(actor.id)
         if active is None:
             latest = self.repository.find_latest_finalized_by_collaborator(actor.id)
+            latest_details = self.get_pallet(latest["public_id"]) if latest is not None else None
+            if latest_details is not None:
+                latest_details["action"] = "already_completed"
+                latest_details["message"] = "Este palete ja foi conferido e finalizado."
             return {
                 "has_active_conference": False,
                 "conference": None,
-                "latest_conference": (
-                    self.get_pallet(latest["public_id"]) if latest is not None else None
-                ),
+                "latest_conference": latest_details,
             }
         return {
             "has_active_conference": True,

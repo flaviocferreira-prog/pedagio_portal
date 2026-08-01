@@ -1,13 +1,43 @@
-# Dados e arquivos temporários locais
+# Dados operacionais locais
 data/*.db
 data/temporary_uploads/
+*.db
+*.sqlite
+*.sqlite3
 
-# Cache Python
+# Ambientes e caches Python
+.venv/
+venv/
+env/
+ENV/
 __pycache__/
 **/__pycache__/
 *.py[cod]
-
-# Ambiente e ferramentas locais
-.venv/
 .pytest_cache/
+.mypy_cache/
 .coverage
+htmlcov/
+
+# Credenciais e ferramentas locais
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+service-account*.json
+google-credentials*.json
+.vscode/
+.idea/
+logs/
+*.log
+temp/
+tmp/
+uploads/
+exports/
+generated/
+output/
+*.tmp
+*.bak
+*.swp
+~$*

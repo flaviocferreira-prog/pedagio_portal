@@ -1,24 +1,52 @@
-# Dados e arquivos temporários locais
+# Dados operacionais locais
 **/data/*.db
 **/data/temporary_uploads/
+*.db
+*.sqlite
+*.sqlite3
 
-# Cache Python
-__pycache__/
-**/__pycache__/
-*.py[cod]
-
-# Ambientes e ferramentas locais
+# Ambientes e caches Python
 .venv/
 venv/
 env/
+ENV/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
+htmlcov/
 
-# Credenciais locais
+# Credenciais
 .env
 .env.*
 !.env.example
 *.pem
 *.key
+credentials.json
+service-account*.json
+google-credentials*.json
+
+# IDE e sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs e temporarios
+logs/
+*.log
+temp/
+tmp/
+uploads/
+exports/
+generated/
+output/
+*.tmp
+*.bak
+*.swp
+~$*
