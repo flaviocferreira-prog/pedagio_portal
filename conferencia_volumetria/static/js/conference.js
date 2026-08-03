@@ -20,6 +20,26 @@ function isActiveConference(data) {
 export function showImportCard() {
   conference = null;
   sessionStorage.removeItem("conference_public_id");
+  $("#carton-code").value = "";
+  $("#carton-list").replaceChildren();
+  $("#extra-list").replaceChildren();
+  boxElements.clear();
+  [
+    "#summary-id", "#summary-file", "#summary-agenda", "#summary-origin",
+    "#summary-operation", "#summary-shift", "#summary-imported-at",
+    "#summary-finalized-at", "#summary-collaborator", "#summary-attempt",
+  ].forEach((selector) => { $(selector).textContent = ""; });
+  [
+    "#summary-expected", "#summary-confirmed", "#summary-pending", "#summary-surplus",
+    "#summary-duplicate",
+  ].forEach((selector) => { $(selector).textContent = "0"; });
+  $("#summary-coverage").textContent = "0%";
+  $("#progress").value = 0;
+  $("#box-count").textContent = "0 caixas";
+  $("#extra-count").textContent = "0 divergentes";
+  $("#summary-finalized-wrap").hidden = true;
+  $("#completion-notice").hidden = true;
+  $("#historical-notice").hidden = true;
   $("#conference").hidden = true;
   $("#upload-card").hidden = false;
   startTimer({});
@@ -41,6 +61,7 @@ function renderSummary(data) {
   $("#summary-id").textContent = data.public_id;
   $("#summary-file").textContent = data.source_filename;
   const importation = data.importation || {};
+  $("#summary-agenda").textContent = importation.agenda || "Não informada";
   $("#summary-origin").textContent = importation.origin || "Não informada";
   $("#summary-operation").textContent = importation.operation === "NIKESTORE" ? "Nike Store" : (importation.operation || "Não informada");
   $("#summary-shift").textContent = importation.shift || "Não informado";
@@ -66,13 +87,15 @@ function renderSummary(data) {
   $("#progress").value = summary.coverage_percent;
   $("#box-count").textContent = `${summary.total_expected} caixas`;
   $("#extra-count").textContent = `${summary.total_extra} divergentes`;
-  const active = data.status === "EM_ABERTO";
-  const awaitingFinalization = active && summary.coverage_percent === 100;
+  const active = data.status === "EM_ABERTO" && Boolean(data.started_at);
+  const awaitingFinalization = active && summary.can_finish;
   $("#carton-form").hidden = !active;
   $("#finish-button").hidden = !active;
+  $("#finish-button").disabled = !summary.can_finish;
   $("#finish-button").classList.toggle("ready-to-finish", awaitingFinalization);
   $("#cancel-conference-button").hidden = !active;
   $("#completion-notice").hidden = !awaitingFinalization;
+  $("#completion-notice").textContent = "100% conferido — aguardando finalização";
   $("#historical-notice").hidden = data.action !== "already_completed";
   $("#sync-button").hidden = data.status !== "FINALIZADA";
   $("#print-button").hidden = data.status !== "FINALIZADA";
@@ -81,26 +104,31 @@ function renderSummary(data) {
   return true;
 }
 
-function updateBoxElement(item, box) {
+function updateBoxElement(item, box, duplicateCodes = new Set()) {
   const confirmed = box.status === "CONFIRMED";
   item.className = confirmed ? "box-item confirmed" : "box-item pending";
   item.replaceChildren();
   const code = document.createElement("strong");
   code.textContent = normalizeCaixaEstoque(box.caixa_estoque);
   const state = document.createElement("span");
-  state.textContent = confirmed
-    ? `Conferida${box.confirmed_at ? ` às ${box.confirmed_at}` : ""}`
-    : "Pendente";
+  state.textContent = duplicateCodes.has(normalizeCaixaEstoque(box.caixa_estoque))
+    ? "DUPLICADO"
+    : confirmed ? `Conferida${box.confirmed_at ? ` às ${box.confirmed_at}` : ""}` : "FALTA";
   item.append(code, state);
 }
 
-function renderExpectedBoxes(boxes) {
+function renderExpectedBoxes(boxes, data) {
   boxElements.clear();
+  const duplicateCodes = new Set(
+    (data.divergences || [])
+      .filter((item) => item.type === "DUPLICIDADE")
+      .map((item) => normalizeCaixaEstoque(item.caixa_estoque)),
+  );
   const fragment = document.createDocumentFragment();
   for (const box of boxes) {
     const item = document.createElement("li");
     item.dataset.caixaEstoque = normalizeCaixaEstoque(box.caixa_estoque);
-    updateBoxElement(item, box);
+    updateBoxElement(item, box, duplicateCodes);
     boxElements.set(normalizeCaixaEstoque(box.caixa_estoque), item);
     fragment.append(item);
   }
@@ -110,12 +138,12 @@ function renderExpectedBoxes(boxes) {
 function renderExtras(extras) {
   const items = extras.map((box) => {
     const item = document.createElement("li");
-    item.className = "extra-item";
+    item.className = "extra-item pending";
     const code = document.createElement("strong");
     code.textContent = normalizeCaixaEstoque(box.caixa_estoque);
-    const attempts = document.createElement("span");
-    attempts.textContent = box.attempts > 1 ? `${box.attempts} leituras` : "Código não esperado";
-    item.append(code, attempts);
+    const status = document.createElement("span");
+    status.textContent = "SOBRA";
+    item.append(code, status);
     return item;
   });
   $("#extra-list").replaceChildren(...items);
@@ -127,8 +155,8 @@ export function render(data) {
     $("#extra-list").replaceChildren();
     return;
   }
-  renderExpectedBoxes(data.cartons);
-  renderExtras(data.unexpected_cartons);
+  renderExpectedBoxes(data.cartons, data);
+  renderExtras(data.unexpected_cartons || []);
   if (data.status === "EM_ABERTO") $("#carton-code").focus();
 }
 
@@ -140,13 +168,25 @@ function applyScanResult(data) {
   );
   if (box) {
     const item = boxElements.get(normalizeCaixaEstoque(box.caixa_estoque));
-    if (item) updateBoxElement(item, box);
+    if (item) {
+      const duplicateCodes = data.last_classification === "DUPLICATE"
+        ? new Set([normalizeCaixaEstoque(data.expected_code)]) : new Set();
+      updateBoxElement(item, box, duplicateCodes);
+    }
   }
-  renderExtras(data.unexpected_cartons);
+  renderExtras(data.unexpected_cartons || []);
 }
 
 async function renderAndStart(data) {
   render(data);
+  if (data.status === "EM_ABERTO" && !data.started_at) {
+    const started = await api(`/api/conferences/${encodeURIComponent(data.public_id)}/start`, {
+      method: "POST",
+      body: "{}",
+    });
+    render(started);
+    return started;
+  }
   return data;
 }
 
@@ -160,20 +200,13 @@ export async function loadActiveConference() {
   if (state.has_active_conference && state.conference) {
     return renderAndStart(state.conference);
   }
-  if (state.latest_conference) {
-    render(state.latest_conference);
-    return state.latest_conference;
-  }
-  if (!state.has_active_conference || !state.conference) {
-    showImportCard();
-    return null;
-  }
+  showImportCard();
   return null;
 }
 
 function pendingMessage(error) {
   if (error.code !== "CONFERENCIA_COM_PENDENCIAS") return error.message;
-  return `${error.message} Existem ${error.details.faltantes ?? 0} caixas faltantes e ${error.details.divergentes ?? 0} caixas divergentes.`;
+  return `${error.message} Existem ${error.details.faltantes ?? 0} caixas faltantes.`;
 }
 
 export function bindConference() {
@@ -240,8 +273,9 @@ export function bindConference() {
     try {
       const result = await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/finish`, { method: "POST", body: "{}" });
       finishModal.close();
-      render(result);
+      showImportCard();
       notify(result.message);
+      $("#new-import-button").focus();
     } catch (error) {
       notify(error instanceof ApiError ? pendingMessage(error) : error.message, "error");
       input.focus();

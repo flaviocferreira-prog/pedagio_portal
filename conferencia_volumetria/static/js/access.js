@@ -15,6 +15,10 @@ let identifying = false;
 let registering = false;
 let editing = false;
 
+document.querySelectorAll('input[type="text"], textarea').forEach((input) => {
+  input.addEventListener("input", () => { input.value = input.value.toUpperCase(); });
+});
+
 function openRegistration() {
   editing = false;
   registerForm.reset();
@@ -72,7 +76,7 @@ registerForm.addEventListener("submit", async (event) => {
         : "/api/colaboradores/cadastro-rapido",
       {
         method: "POST",
-        body: JSON.stringify({ nome: nameInput.value, matricula: registration, turno: shiftInput.value }),
+        body: JSON.stringify({ nome: nameInput.value.trim().toUpperCase(), matricula: registration, turno: shiftInput.value }),
       },
     );
     const collaborator = result.colaborador;

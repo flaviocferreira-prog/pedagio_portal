@@ -129,8 +129,3 @@ class PalletFileImporter:
                 "Exporte CAIXA_ESTOQUE como texto para preservar o codigo."
             )
         return normalize_caixa_estoque(value)
-
-
-# Existing application composition imports this name.  It now points to the
-# only importer instead of leaving an alternate legacy implementation alive.
-OpenpyxlPalletReader = PalletFileImporter

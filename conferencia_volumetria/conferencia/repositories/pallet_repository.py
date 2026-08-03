@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from conferencia.domain.box_codes import normalize_caixa_estoque
+from conferencia.domain.box_codes import comparison_code_without_leading_zeros, normalize_caixa_estoque
 from conferencia.domain.entities import (
     CartonStatus,
     CollaboratorContext,
@@ -21,18 +21,25 @@ class RepositoryStateError(Exception):
 
 
 class PendingConferenceError(Exception):
-    def __init__(self, missing: int, divergent: int, extra: int, duplicate: int) -> None:
+    def __init__(self, missing: int, divergent: int, extra: int, duplicate: int, by_type: dict[str, int] | None = None) -> None:
         super().__init__("A conferência possui pendências.")
         self.missing = missing
         self.divergent = divergent
         self.extra = extra
         self.duplicate = duplicate
+        self.by_type = by_type or {}
 
 
 class ActiveConferenceError(Exception):
     def __init__(self, public_id: str) -> None:
         super().__init__(public_id)
         self.public_id = public_id
+
+
+class AmbiguousBoxCodeError(Exception):
+    def __init__(self, matches: list[str]) -> None:
+        super().__init__("AMBIGUOUS_BOX_CODE")
+        self.matches = matches
 
 
 class PalletRepository:
@@ -46,6 +53,7 @@ class PalletRepository:
         source_filename: str,
         carton_codes: list[str],
         source_fingerprint: str,
+        agenda: str,
         origin: str,
         operation: str,
         shift: str,
@@ -69,11 +77,11 @@ class PalletRepository:
                 """
                 INSERT INTO pallets(
                     code, public_id, collaborator_id, source_filename,
-                    source_fingerprint, import_origin, import_operation, imported_shift,
-                    imported_at, created_by_collaborator_id, total_expected, updated_at,
+                    source_fingerprint, import_agenda, import_origin, import_operation, imported_shift,
+                    created_by_collaborator_id, total_expected,
                     conference_status, print_status, content_hash, previous_conference_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     public_id,
@@ -81,13 +89,12 @@ class PalletRepository:
                     collaborator.registration,
                     source_filename,
                     source_fingerprint,
+                    agenda,
                     origin,
                     operation,
                     shift,
-                    None,
                     collaborator.id,
                     len(carton_codes),
-                    None,
                     ConferenceStatus.OPEN,
                     "AVAILABLE",
                     content_hash,
@@ -105,29 +112,9 @@ class PalletRepository:
             connection.execute(
                 """
                 INSERT INTO conference_attempts(pallet_id, attempt_number, status)
-                VALUES (?, 1, 'IN_PROGRESS')
+                VALUES (?, 1, 'READY')
                 """,
                 (pallet_id,),
-            )
-            # O instante oficial só é fixado após a conferência, suas caixas e a
-            # tentativa terem sido persistidas, ainda antes do commit atômico.
-            imported_at = self._now(connection)
-            connection.execute(
-                """
-                UPDATE pallets
-                SET status = 'IN_PROGRESS', imported_at = ?, started_at = ?,
-                    started_by_collaborator_id = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (imported_at, imported_at, collaborator.id, imported_at, pallet_id),
-            )
-            connection.execute(
-                """
-                UPDATE conference_attempts
-                SET started_at = ?, started_by_collaborator_id = ?
-                WHERE pallet_id = ? AND attempt_number = 1
-                """,
-                (imported_at, collaborator.id, pallet_id),
             )
             action = "created_after_cancellation" if previous is not None else "created"
             self._audit(
@@ -332,6 +319,15 @@ class PalletRepository:
                     """,
                     (attempt["id"],),
                 ).fetchall()
+            divergences = connection.execute(
+                """SELECT d.*, finder.matricula AS found_by, resolver.matricula AS resolved_by
+                   FROM conference_divergences d
+                   LEFT JOIN colaboradores finder ON finder.id = d.found_by_collaborator_id
+                   LEFT JOIN colaboradores resolver ON resolver.id = d.resolved_by_collaborator_id
+                   WHERE d.pallet_id = ? ORDER BY d.id DESC""",
+                (pallet["id"],),
+            ).fetchall()
+            divergence_counts = self._divergence_counts(connection, pallet["id"])
             attempts = connection.execute(
                 """
                 SELECT a.id, a.attempt_number, a.status, a.started_at, a.finished_at,
@@ -369,6 +365,7 @@ class PalletRepository:
             "is_reconference": bool(pallet["is_reconference"]),
             "reconference_reason": pallet["reconference_reason"],
             "importation": {
+                "agenda": pallet["import_agenda"],
                 "origin": pallet["import_origin"],
                 "operation": pallet["import_operation"],
                 "shift": pallet["imported_shift"],
@@ -405,6 +402,7 @@ class PalletRepository:
                 counts["confirmed"],
                 counts["extra"],
                 counts["duplicate"],
+                divergence_counts,
             ),
             "cartons": [
                 {
@@ -431,6 +429,16 @@ class PalletRepository:
                     "attempts": row["attempts"],
                 }
                 for row in extras
+            ],
+            "divergences": [
+                {
+                    "id": row["id"], "type": row["divergence_type"],
+                    "caixa_estoque": normalize_caixa_estoque(row["carton_code"]),
+                    "description": row["description"], "status": row["status"],
+                    "found_at": row["found_at"], "found_by": row["found_by"],
+                    "resolved_at": row["resolved_at"], "resolved_by": row["resolved_by"],
+                    "resolution_note": row["resolution_note"],
+                } for row in divergences
             ],
             "attempts": [
                 {
@@ -467,7 +475,7 @@ class PalletRepository:
                 UPDATE pallets
                 SET status = 'COMPLETED_WITH_DIVERGENCE', conference_status = ?,
                     cancelled_at = ?, cancelled_by_collaborator_id = ?, finished_at = ?,
-                    duration_seconds = MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER)),
+                    duration_seconds = MAX(0, CAST((julianday(?) - julianday(COALESCE(started_at, imported_at, created_at))) * 86400 AS INTEGER)),
                     final_justification = 'CANCELADA', sync_status = 'NOT_READY', updated_at = ?
                 WHERE id = ? AND conference_status = ?
                 """,
@@ -485,11 +493,10 @@ class PalletRepository:
             )
 
     def start(self, pallet_id: int, collaborator: CollaboratorContext) -> None:
-        # O cronômetro nasce no upload. Esta rota legada permanece idempotente
-        # para clientes já publicados, sem reiniciar horário ou progresso.
-        with self.database.connection() as connection:
+        """Start exactly once after the client has rendered the imported boxes."""
+        with self.database.connection(immediate=True) as connection:
             pallet = connection.execute(
-                "SELECT conference_status FROM pallets WHERE id = ?", (pallet_id,)
+                "SELECT conference_status, started_at FROM pallets WHERE id = ?", (pallet_id,)
             ).fetchone()
             if pallet is None:
                 raise RepositoryStateError("NOT_FOUND")
@@ -497,13 +504,35 @@ class PalletRepository:
                 raise RepositoryStateError("CANCELLED")
             if pallet["conference_status"] != ConferenceStatus.OPEN:
                 raise RepositoryStateError("FINISHED")
+            if pallet["started_at"] is not None:
+                return
+            now = self._now(connection)
+            updated = connection.execute(
+                """
+                UPDATE pallets
+                SET status = 'IN_PROGRESS', imported_at = ?, started_at = ?,
+                    started_by_collaborator_id = ?, updated_at = ?
+                WHERE id = ? AND conference_status = ? AND started_at IS NULL
+                """,
+                (now, now, collaborator.id, now, pallet_id, ConferenceStatus.OPEN),
+            )
+            if updated.rowcount != 1:
+                raise RepositoryStateError("CHANGED")
+            connection.execute(
+                """
+                UPDATE conference_attempts
+                SET status = 'IN_PROGRESS', started_at = ?, started_by_collaborator_id = ?
+                WHERE pallet_id = ? AND attempt_number = 1 AND status = 'READY'
+                """,
+                (now, collaborator.id, pallet_id),
+            )
 
     def process_scan(
         self,
         pallet_id: int,
         code: str,
         collaborator: CollaboratorContext,
-    ) -> tuple[ScanClassification, str | None]:
+    ) -> tuple[ScanClassification, str | None, str | None, str | None]:
         with self.database.connection(immediate=True) as connection:
             pallet = connection.execute(
                 "SELECT status, conference_status, started_at, cancelled_at FROM pallets WHERE id = ?", (pallet_id,)
@@ -525,10 +554,30 @@ class PalletRepository:
                 """
                 SELECT id, code, status, confirmed_at
                 FROM expected_cartons
-                WHERE pallet_id = ? AND code = ? COLLATE NOCASE
+                WHERE pallet_id = ? AND code = ?
                 """,
                 (pallet_id, code),
             ).fetchone()
+            match_type: str | None = "EXACT" if expected is not None else None
+            if expected is None:
+                comparison_code = comparison_code_without_leading_zeros(code)
+                normalized_matches = [
+                    row
+                    for row in connection.execute(
+                        """
+                        SELECT id, code, status, confirmed_at
+                        FROM expected_cartons
+                        WHERE pallet_id = ?
+                        """,
+                        (pallet_id,),
+                    ).fetchall()
+                    if comparison_code_without_leading_zeros(row["code"]) == comparison_code
+                ]
+                if len(normalized_matches) > 1:
+                    raise AmbiguousBoxCodeError([str(row["code"]) for row in normalized_matches])
+                if normalized_matches:
+                    expected = normalized_matches[0]
+                    match_type = "NORMALIZED"
             now = self._now(connection)
             first_seen: str | None = None
             if expected is not None and expected["status"] == CartonStatus.PENDING:
@@ -575,9 +624,18 @@ class PalletRepository:
                         else ScanClassification.DUPLICATE
                     )
                     first_seen = None if updated.rowcount == 1 else expected["confirmed_at"]
+                    if classification == ScanClassification.DUPLICATE:
+                        self._record_divergence(
+                            connection, pallet_id, attempt["id"], "DUPLICIDADE", code,
+                            "Leitura duplicada de caixa esperada.", collaborator,
+                        )
             elif expected is not None:
                 classification = ScanClassification.DUPLICATE
                 first_seen = expected["confirmed_at"]
+                self._record_divergence(
+                    connection, pallet_id, attempt["id"], "DUPLICIDADE", code,
+                    "Leitura duplicada de caixa esperada.", collaborator,
+                )
             else:
                 extra = connection.execute(
                     """
@@ -599,6 +657,10 @@ class PalletRepository:
                         (pallet_id, attempt["id"], code, now, now, collaborator.id),
                     )
                     classification = ScanClassification.EXTRA
+                    self._record_divergence(
+                        connection, pallet_id, attempt["id"], "CAIXA_NAO_ESPERADA", code,
+                        "Caixa não esperada para este palete.", collaborator,
+                    )
                 else:
                     connection.execute(
                         """
@@ -631,7 +693,7 @@ class PalletRepository:
             connection.execute(
                 "UPDATE pallets SET updated_at = ? WHERE id = ?", (now, pallet_id)
             )
-            return classification, first_seen
+            return classification, first_seen, match_type, (str(expected["code"]) if expected is not None else None)
 
     def finish(self, pallet_id: int, collaborator: CollaboratorContext) -> None:
         with self.database.connection(immediate=True) as connection:
@@ -651,9 +713,19 @@ class PalletRepository:
                 raise RepositoryStateError("CHANGED")
             counts = self._counts(connection, pallet_id, attempt["id"])
             missing = max(0, counts["expected"] - counts["confirmed"])
-            if missing or counts["extra"] or counts["duplicate"]:
+            if missing:
+                for row in connection.execute(
+                    "SELECT code FROM expected_cartons WHERE pallet_id = ? AND status = 'PENDING'",
+                    (pallet_id,),
+                ):
+                    self._record_divergence(
+                        connection, pallet_id, attempt["id"], "FALTA", row["code"],
+                        "Caixa esperada ainda não conferida.", collaborator,
+                        deduplicate=True,
+                    )
+            if missing:
                 raise PendingConferenceError(
-                    missing, counts["extra"], counts["extra"], counts["duplicate"]
+                    missing, 0, 0, 0,
                 )
             now = self._now(connection)
             duration = connection.execute(
@@ -683,22 +755,43 @@ class PalletRepository:
                 (now, collaborator.id, attempt["id"]),
             )
 
-    def restart(self, pallet_id: int, collaborator: CollaboratorContext) -> None:
-        raise RepositoryStateError("RESTART_DISABLED")
+    @staticmethod
+    def _record_divergence(
+        connection: sqlite3.Connection, pallet_id: int, attempt_id: int,
+        divergence_type: str, code: str, description: str,
+        collaborator: CollaboratorContext, *, deduplicate: bool = False,
+    ) -> None:
+        if deduplicate and connection.execute(
+            """SELECT 1 FROM conference_divergences
+               WHERE pallet_id = ? AND divergence_type = ? AND carton_code = ? AND status = 'PENDENTE'""",
+            (pallet_id, divergence_type, code),
+        ).fetchone() is not None:
+            return
+        connection.execute(
+            """INSERT INTO conference_divergences(
+                pallet_id, attempt_id, divergence_type, carton_code, description,
+                found_at, found_by_collaborator_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (pallet_id, attempt_id, divergence_type, code, description,
+             PalletRepository._now(connection), collaborator.id),
+        )
 
-    def list_recent(self) -> list[dict]:
-        with self.database.connection() as connection:
-            public_ids = [
-                row["public_id"]
-                for row in connection.execute(
-                    "SELECT public_id FROM pallets ORDER BY id DESC LIMIT 100"
-                )
-            ]
-        return [
-            details
-            for public_id in public_ids
-            if (details := self.details(public_id)) is not None
-        ]
+    @staticmethod
+    def _divergence_counts(connection: sqlite3.Connection, pallet_id: int) -> dict:
+        by_type = {key: 0 for key in ("FALTA", "SOBRA", "DUPLICIDADE", "CAIXA_NAO_ESPERADA", "INCONSISTENCIA")}
+        total = pending = resolved = 0
+        for row in connection.execute(
+            """SELECT divergence_type, status, COUNT(*) AS total
+               FROM conference_divergences WHERE pallet_id = ?
+               GROUP BY divergence_type, status""", (pallet_id,)
+        ):
+            total += row["total"]
+            if row["status"] == "PENDENTE":
+                pending += row["total"]
+                by_type[row["divergence_type"]] += row["total"]
+            else:
+                resolved += row["total"]
+        return {"total": total, "pending": pending, "resolved": resolved, "by_type": by_type}
 
     @staticmethod
     def _active_for_collaborator(
@@ -832,13 +925,15 @@ class PalletRepository:
 
     @staticmethod
     def _summary(
-        expected: int, confirmed: int, extra: int, duplicate: int
+        expected: int, confirmed: int, extra: int, duplicate: int,
+        divergence_counts: dict | None = None,
     ) -> dict[str, int | float]:
         missing = max(0, expected - confirmed)
         coverage = min(
             100.0,
             max(0.0, (confirmed / expected * 100) if expected else 0.0),
         )
+        divergence_counts = divergence_counts or {"total": 0, "pending": 0, "resolved": 0, "by_type": {}}
         return {
             "total_expected": expected,
             "total_confirmed": confirmed,
@@ -853,4 +948,9 @@ class PalletRepository:
             "surplus_quantity": extra,
             "divergent_quantity": extra,
             "duplicate_quantity": duplicate,
+            "divergences_found": divergence_counts["total"],
+            "divergences_pending": divergence_counts["pending"],
+            "divergences_resolved": divergence_counts["resolved"],
+            "pending_divergences_by_type": divergence_counts["by_type"],
+            "can_finish": confirmed == expected,
         }

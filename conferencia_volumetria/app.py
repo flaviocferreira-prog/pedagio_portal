@@ -6,7 +6,7 @@ from http.server import ThreadingHTTPServer
 from conferencia.controllers.conference_controller import ConferenceController
 from conferencia.infrastructure.database import SQLiteDatabase
 from conferencia.infrastructure.settings import AppSettings
-from conferencia.readers.excel_reader import OpenpyxlPalletReader
+from conferencia.readers.excel_reader import PalletFileImporter
 from conferencia.repositories.pallet_repository import PalletRepository
 from conferencia.repositories.colaborador_repository import ColaboradorRepository
 from conferencia.services.acesso_service import AcessoService
@@ -24,9 +24,11 @@ def main() -> None:
     database = SQLiteDatabase()
     database.initialize()
     repository = PalletRepository(database)
-    ApplicationHandler.controller = ConferenceController(ConferenceService(repository, OpenpyxlPalletReader(), AppSettings()))
+    settings = AppSettings()
+    ApplicationHandler.controller = ConferenceController(ConferenceService(repository, PalletFileImporter(), settings))
     ApplicationHandler.acesso_service = AcessoService(ColaboradorRepository(database))
     ApplicationHandler.sessions = SessionManager()
+    ApplicationHandler.max_json_bytes = settings.max_json_bytes
     server = ThreadingHTTPServer((args.host, args.port), ApplicationHandler)
     print(f"Conferência de Volumetria disponível em http://{args.host}:{args.port}")
     try:

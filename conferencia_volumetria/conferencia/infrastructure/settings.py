@@ -11,3 +11,8 @@ class AppSettings:
     collaborator_registration_min_length: int = int(os.getenv("CONFERENCE_REGISTRATION_MIN_LENGTH", "1"))
     collaborator_registration_max_length: int = int(os.getenv("CONFERENCE_REGISTRATION_MAX_LENGTH", "20"))
     temporary_directory: Path = Path(__file__).resolve().parents[2] / "data" / "temporary_uploads"
+
+    @property
+    def max_json_bytes(self) -> int:
+        """Allow the Base64 envelope without accepting an unbounded HTTP body."""
+        return ((self.max_upload_bytes + 2) // 3) * 4 + 1024 * 1024

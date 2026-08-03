@@ -87,6 +87,12 @@ class SQLiteDatabase:
             if 10 not in applied:
                 self._migration_010_assinatura_e_auditoria_de_palete(connection)
                 self._record(connection, 10, "assinatura de conteudo, reconferencia e auditoria")
+            if 11 not in applied:
+                self._migration_011_divergencias_auditaveis(connection)
+                self._record(connection, 11, "divergencias pendentes e resolvidas por conferencia")
+            if 12 not in applied:
+                self._migration_012_agenda_importacao(connection)
+                self._record(connection, 12, "agenda obrigatoria da importacao")
             violations = connection.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise RuntimeError("A migração de caixa estoque violou chaves estrangeiras.")
@@ -607,6 +613,39 @@ class SQLiteDatabase:
             WHERE conference_status = 'EM_ABERTO' AND status = 'READY'
             """
         )
+
+    @staticmethod
+    def _migration_011_divergencias_auditaveis(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS conference_divergences (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pallet_id INTEGER NOT NULL REFERENCES pallets(id) ON DELETE RESTRICT,
+                attempt_id INTEGER REFERENCES conference_attempts(id) ON DELETE RESTRICT,
+                divergence_type TEXT NOT NULL CHECK(divergence_type IN (
+                    'FALTA', 'SOBRA', 'DUPLICIDADE', 'CAIXA_NAO_ESPERADA', 'INCONSISTENCIA'
+                )),
+                carton_code TEXT,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDENTE' CHECK(status IN ('PENDENTE', 'RESOLVIDA')),
+                found_at TEXT NOT NULL,
+                found_by_collaborator_id INTEGER REFERENCES colaboradores(id) ON DELETE SET NULL,
+                resolved_at TEXT,
+                resolved_by_collaborator_id INTEGER REFERENCES colaboradores(id) ON DELETE SET NULL,
+                resolution_note TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_divergences_pallet_status
+                ON conference_divergences(pallet_id, status, id);
+            CREATE INDEX IF NOT EXISTS idx_divergences_attempt_status
+                ON conference_divergences(attempt_id, status, id);
+            """
+        )
+
+    @staticmethod
+    def _migration_012_agenda_importacao(connection: sqlite3.Connection) -> None:
+        SQLiteDatabase._add_column_if_missing(connection, "pallets", "import_agenda", "TEXT")
         connection.execute(
             """
             UPDATE conference_attempts

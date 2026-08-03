@@ -42,6 +42,7 @@ class ApplicationHandler(BaseHTTPRequestHandler):
     controller: ConferenceController
     acesso_service: AcessoService
     sessions: SessionManager
+    max_json_bytes = 15 * 1024 * 1024
 
     def do_GET(self) -> None:
         path = unquote(urlparse(self.path).path)
@@ -70,9 +71,17 @@ class ApplicationHandler(BaseHTTPRequestHandler):
                 return self._not_found()
             public_id, action = route
             if action == "boxes":
-                return self._handle(lambda: self.controller.get_boxes(public_id))
+                return self._handle(
+                    lambda: self.controller.get_boxes(
+                        public_id, self._collaborator(self._session())
+                    )
+                )
             if action is None:
-                return self._handle(lambda: self.controller.get_pallet(public_id))
+                return self._handle(
+                    lambda: self.controller.get_pallet(
+                        public_id, self._collaborator(self._session())
+                    )
+                )
             return self._not_found()
         if path.startswith("/static/"):
             target = (STATIC_ROOT / path.removeprefix("/static/")).resolve()
@@ -99,6 +108,10 @@ class ApplicationHandler(BaseHTTPRequestHandler):
         collaborator = self._collaborator(session)
         try:
             payload = self._json_body()
+        except PayloadTooLargeError as error:
+            return self._json_application_error(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE, error
+            )
         except InvalidJsonError as error:
             return self._json_error(
                 HTTPStatus.BAD_REQUEST,
@@ -120,9 +133,6 @@ class ApplicationHandler(BaseHTTPRequestHandler):
                 public_id, payload, collaborator
             ),
             "finish": lambda: self.controller.finish_pallet(
-                public_id, collaborator
-            ),
-            "restart": lambda: self.controller.restart_pallet(
                 public_id, collaborator
             ),
             "reconference": lambda: self.controller.authorize_reconference(
@@ -177,6 +187,8 @@ class ApplicationHandler(BaseHTTPRequestHandler):
     def _json_body(self) -> dict[str, object]:
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length < 0 or content_length > self.max_json_bytes:
+                raise PayloadTooLargeError("A requisição excede o limite permitido.")
             raw = self.rfile.read(content_length) if content_length else b"{}"
             payload = json.loads(raw)
         except (ValueError, UnicodeError, json.JSONDecodeError) as error:
@@ -196,6 +208,8 @@ class ApplicationHandler(BaseHTTPRequestHandler):
                 "Colaborador identificado.",
                 cookie=token,
             )
+        except PayloadTooLargeError as error:
+            self._json_application_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, error)
         except InvalidJsonError as error:
             self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_JSON", str(error))
         except ValidationError as error:
@@ -222,6 +236,8 @@ class ApplicationHandler(BaseHTTPRequestHandler):
                 {"colaborador": collaborator},
                 "Colaborador cadastrado com sucesso.",
             )
+        except PayloadTooLargeError as error:
+            self._json_application_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, error)
         except InvalidJsonError as error:
             self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_JSON", str(error))
         except ValidationError as error:
@@ -250,6 +266,8 @@ class ApplicationHandler(BaseHTTPRequestHandler):
                 {"colaborador": collaborator},
                 "Colaborador atualizado com sucesso.",
             )
+        except PayloadTooLargeError as error:
+            self._json_application_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, error)
         except InvalidJsonError as error:
             self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_JSON", str(error))
         except ValidationError as error:

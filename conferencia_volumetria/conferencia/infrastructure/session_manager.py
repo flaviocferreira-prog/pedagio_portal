@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 import time
+from threading import RLock
 from typing import TypedDict
 
 
@@ -24,29 +25,33 @@ class SessionManager:
     def __init__(self, timeout_seconds: int = 1800) -> None:
         self.timeout_seconds = timeout_seconds
         self.sessions: dict[str, SessionData] = {}
+        self._lock = RLock()
 
     def create(self, collaborator: dict) -> str:
         now = time.time()
         token = secrets.token_urlsafe(32)
-        self.sessions[token] = {
-            SESSION_COLLABORATOR_ID: int(collaborator["id"]),
-            SESSION_COLLABORATOR_REGISTRATION: str(collaborator["matricula"]),
-            SESSION_COLLABORATOR_NAME: str(collaborator["nome"]),
-            SESSION_COLLABORATOR_SHIFT: str(collaborator["turno"]),
-            "data_hora_acesso": now,
-            "last": now,
-        }
+        with self._lock:
+            self.sessions[token] = {
+                SESSION_COLLABORATOR_ID: int(collaborator["id"]),
+                SESSION_COLLABORATOR_REGISTRATION: str(collaborator["matricula"]),
+                SESSION_COLLABORATOR_NAME: str(collaborator["nome"]),
+                SESSION_COLLABORATOR_SHIFT: str(collaborator["turno"]),
+                "data_hora_acesso": now,
+                "last": now,
+            }
         return token
 
     def get(self, token: str | None) -> SessionData | None:
-        data = self.sessions.get(token or "")
-        if data is None:
-            return None
-        if time.time() - data["last"] > self.timeout_seconds:
-            self.sessions.pop(token or "", None)
-            return None
-        data["last"] = time.time()
-        return data
+        with self._lock:
+            data = self.sessions.get(token or "")
+            if data is None:
+                return None
+            if time.time() - data["last"] > self.timeout_seconds:
+                self.sessions.pop(token or "", None)
+                return None
+            data["last"] = time.time()
+            return data
 
     def destroy(self, token: str | None) -> None:
-        self.sessions.pop(token or "", None)
+        with self._lock:
+            self.sessions.pop(token or "", None)

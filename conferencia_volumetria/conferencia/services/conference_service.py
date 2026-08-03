@@ -15,9 +15,10 @@ from conferencia.domain.entities import (
     ScanClassification,
 )
 from conferencia.infrastructure.settings import AppSettings
-from conferencia.readers.excel_reader import OpenpyxlPalletReader
+from conferencia.readers.excel_reader import PalletFileImporter
 from conferencia.repositories.pallet_repository import (
     ActiveConferenceError,
+    AmbiguousBoxCodeError,
     PalletRepository,
     PendingConferenceError,
     RepositoryStateError,
@@ -66,7 +67,7 @@ class ConferenceService:
     def __init__(
         self,
         repository: PalletRepository,
-        excel_reader: OpenpyxlPalletReader,
+        excel_reader: PalletFileImporter,
         settings: AppSettings | None = None,
     ) -> None:
         self.repository = repository
@@ -75,6 +76,7 @@ class ConferenceService:
 
     def import_pallet(self, import_data: ConferenceImport) -> dict:
         collaborator = self._validate_collaborator(import_data.collaborator)
+        agenda = self._required_upper(import_data.agenda, "Agenda")
         origin = self._choice(import_data.origin, self.ORIGINS, "origem")
         operation = self._choice(import_data.operation, self.OPERATIONS, "operação")
         extension = self._safe_extension(import_data.filename)
@@ -116,6 +118,7 @@ class ConferenceService:
                 import_data.filename,
                 carton_codes,
                 source_fingerprint,
+                agenda,
                 origin,
                 operation,
                 collaborator.shift,
@@ -131,15 +134,10 @@ class ConferenceService:
         result = self.get_pallet(str(decision["public_id"]))
         action = str(decision["action"])
         if action == "already_completed":
-            owner = result["collaborator"]
             result.update({
                 "action": action,
-                "message": (
-                    "Conferência já realizada. Este palete já foi conferido anteriormente e não pode ser iniciado novamente. "
-                    f"Conferente: {owner['name']}. Matrícula: {owner['registration']}. "
-                    f"Finalizado em: {result['finalization']['finished_at']}. "
-                    f"Total conferido: {result['summary']['total_confirmed']} caixas."
-                ),
+                "already_completed": True,
+                "message": "Este arquivo já foi conferido e finalizado. Não é permitido iniciar uma nova conferência com o mesmo conteúdo.",
                 "can_authorize_reconference": collaborator.shift == "ADM",
             })
             return result
@@ -248,11 +246,16 @@ class ConferenceService:
             raise NotFoundError("Conferência não encontrada.")
         return pallet
 
+    def get_pallet_for_collaborator(
+        self, public_id: str, collaborator: CollaboratorContext
+    ) -> dict:
+        self._pallet_for_collaborator(public_id, collaborator)
+        return self.get_pallet(public_id)
+
     def start_pallet(
         self, public_id: str, collaborator: CollaboratorContext
     ) -> dict:
-        actor = self._validate_collaborator(collaborator)
-        pallet = self._find(public_id)
+        actor, pallet = self._pallet_for_collaborator(public_id, collaborator)
         try:
             self.repository.start(pallet["id"], actor)
         except RepositoryStateError as error:
@@ -267,15 +270,20 @@ class ConferenceService:
         carton_code: object,
         collaborator: CollaboratorContext,
     ) -> dict:
-        actor = self._validate_collaborator(collaborator)
+        actor, pallet = self._pallet_for_collaborator(public_id, collaborator)
         code = normalize_caixa_estoque(carton_code)
         if not code:
             raise InvalidScanError("Código da caixa é obrigatório.")
-        pallet = self._find(public_id)
         try:
-            classification, first_seen = self.repository.process_scan(
+            classification, first_seen, match_type, expected_code = self.repository.process_scan(
                 pallet["id"], code, actor
             )
+        except AmbiguousBoxCodeError as error:
+            raise ConflictError(
+                "O código informado corresponde a mais de uma caixa esperada. Informe o código completo.",
+                code="AMBIGUOUS_BOX_CODE",
+                details={"matches": error.matches},
+            ) from error
         except RepositoryStateError as error:
             self._raise_state_error(error, action="scan")
         result = self.get_pallet(pallet["public_id"])
@@ -285,7 +293,11 @@ class ConferenceService:
                 "last_classification": classification,
                 "result": public_result,
                 "message": message,
-                "caixa_estoque": code,
+                "caixa_estoque": expected_code or code,
+                "scanned_code": code,
+                "expected_code": expected_code,
+                "match_type": match_type,
+                "code": "BOX_NOT_FOUND" if classification == ScanClassification.EXTRA else None,
                 "first_confirmation_at": first_seen,
             }
         )
@@ -294,8 +306,7 @@ class ConferenceService:
     def finish_pallet(
         self, public_id: str, collaborator: CollaboratorContext
     ) -> dict:
-        actor = self._validate_collaborator(collaborator)
-        pallet = self._find(public_id)
+        actor, pallet = self._pallet_for_collaborator(public_id, collaborator)
         if pallet["conference_status"] == "CANCELADA":
             self._raise_state_error(RepositoryStateError("CANCELLED"), action="finish")
         if pallet["conference_status"] == "FINALIZADA":
@@ -313,6 +324,8 @@ class ConferenceService:
                     "divergentes": error.divergent,
                     "sobras": error.extra,
                     "duplicidades": error.duplicate,
+                    "caixas_nao_esperadas": error.by_type.get("CAIXA_NAO_ESPERADA", 0),
+                    "faltas": error.by_type.get("FALTA", error.missing),
                 },
             ) from error
         except RepositoryStateError as error:
@@ -321,29 +334,10 @@ class ConferenceService:
         result["message"] = "Conferência finalizada com sucesso."
         return result
 
-    def restart_pallet(
-        self, public_id: str, collaborator: CollaboratorContext
-    ) -> dict:
-        self._validate_collaborator(collaborator)
-        raise ConflictError(
-            "O reinÃ­cio foi removido para preservar a conferÃªncia. Cancele-a e importe uma nova planilha.",
-            code="REINICIO_NAO_PERMITIDO",
-        )
-        actor = self._validate_collaborator(collaborator)
-        pallet = self._find(public_id)
-        try:
-            self.repository.restart(pallet["id"], actor)
-        except RepositoryStateError as error:
-            self._raise_state_error(error, action="restart")
-        result = self.get_pallet(pallet["public_id"])
-        result["message"] = "Conferência reiniciada. Uma nova tentativa foi criada."
-        return result
-
     def cancel_pallet(
         self, public_id: str, collaborator: CollaboratorContext
     ) -> dict:
-        actor = self._validate_collaborator(collaborator)
-        pallet = self._find(public_id)
+        actor, pallet = self._pallet_for_collaborator(public_id, collaborator)
         try:
             self.repository.cancel(pallet["id"], actor)
         except RepositoryStateError as error:
@@ -351,27 +345,17 @@ class ConferenceService:
         result = self.get_pallet(pallet["public_id"])
         result["message"] = "ConferÃªncia cancelada. O histÃ³rico foi preservado e uma nova importaÃ§Ã£o estÃ¡ liberada."
         return result
-        return {
-            "public_id": pallet["public_id"],
-            "status": "CANCELLED",
-            "redirect_url": "/conference",
-            "message": "Conferência cancelada. Importe um novo arquivo para continuar.",
-        }
-
-    def list_pallets(self) -> list[dict]:
-        return self.repository.list_recent()
 
     def sync_pallet(
         self, public_id: str, collaborator: CollaboratorContext
     ) -> dict:
-        actor = self._validate_collaborator(collaborator)
+        actor, pallet = self._pallet_for_collaborator(public_id, collaborator)
         conference = self.get_pallet(public_id)
         if conference["workflow_status"] != "FINALIZADA":
             raise ConflictError(
                 "A sincronização só é permitida após a finalização."
             )
         message = "Integração com Google Sheets ainda não está configurada."
-        pallet = self._find(public_id)
         self.repository.record_sync_not_configured(pallet["id"], actor, message)
         return {
             "public_id": conference["public_id"],
@@ -387,6 +371,15 @@ class ConferenceService:
             raise NotFoundError("Conferência não encontrada.")
         return pallet
 
+    def _pallet_for_collaborator(
+        self, public_id: str, collaborator: CollaboratorContext
+    ) -> tuple[CollaboratorContext, sqlite3.Row]:
+        actor = self._validate_collaborator(collaborator)
+        pallet = self._find(public_id)
+        if pallet["created_by_collaborator_id"] != actor.id:
+            raise NotFoundError("Conferência não encontrada.")
+        return actor, pallet
+
     @staticmethod
     def _active_conference_error(public_id: str) -> ConflictError:
         return ConflictError(
@@ -398,7 +391,7 @@ class ConferenceService:
     @staticmethod
     def _scan_response(classification: ScanClassification) -> tuple[str, str]:
         if classification == ScanClassification.MATCHED:
-            return "CONFERIDA", "Conferência OK."
+            return "CONFERIDA", "Caixa conferida com sucesso."
         if classification == ScanClassification.EXTRA:
             return (
                 "DIVERGENTE",
@@ -474,6 +467,13 @@ class ConferenceService:
         cleaned = value.strip() if isinstance(value, str) else ""
         if not cleaned:
             raise ValidationError(f"{label} é obrigatório.")
+        return cleaned
+
+    @staticmethod
+    def _required_upper(value: object, label: str) -> str:
+        cleaned = " ".join(value.split()).upper() if isinstance(value, str) else ""
+        if not cleaned:
+            raise ValidationError(f"{label} é obrigatória.")
         return cleaned
 
     @staticmethod

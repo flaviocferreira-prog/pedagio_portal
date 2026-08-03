@@ -6,6 +6,7 @@ const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const modal = document.querySelector("#import-modal");
 const form = document.querySelector("#import-form");
 const fileInput = document.querySelector("#pallet-file");
+const agendaInput = document.querySelector("#import-agenda");
 const confirmButton = document.querySelector("#import-confirm");
 const closeButton = document.querySelector("#import-close");
 const summary = document.querySelector("#import-summary");
@@ -31,16 +32,17 @@ function validFile(file) {
 
 function updateModal() {
   const file = fileInput.files?.[0];
+  const agenda = agendaInput.value.trim().toUpperCase();
   const originReady = Boolean(origin);
   document.querySelectorAll("[data-origin]").forEach((button) => button.classList.toggle("selected", button.dataset.origin === origin));
   document.querySelectorAll("[data-operation]").forEach((button) => { button.disabled = !originReady; button.classList.toggle("selected", button.dataset.operation === operation); });
   fileInput.disabled = !(origin && operation);
   const collaborator = collaboratorSummary();
-  const ready = origin && operation && validFile(file) && collaborator.nome && ["T1", "T2", "T3", "ADM"].includes(collaborator.turno);
+  const ready = agenda && origin && operation && validFile(file) && collaborator.nome && ["T1", "T2", "T3", "ADM"].includes(collaborator.turno);
   confirmButton.disabled = !ready || importing;
   summary.textContent = ready
-    ? `Origem: ${origin === "PORTAL" ? "Portal" : "TL"} | Operação: ${operation === "NIKESTORE" ? "Nike Store" : operation} | Arquivo: ${file.name} | Colaborador: ${collaborator.nome} | Turno: ${collaborator.turno}`
-    : "Preencha origem, operação e arquivo para revisar a importação.";
+    ? `Agenda: ${agenda} | Origem: ${origin === "PORTAL" ? "Portal" : "TL"} | Operação: ${operation === "NIKESTORE" ? "Nike Store" : operation} | Arquivo: ${file.name} | Colaborador: ${collaborator.nome} | Turno: ${collaborator.turno}`
+    : "Preencha agenda, origem, operação e arquivo para revisar a importação.";
 }
 
 function resetModal() {
@@ -59,16 +61,22 @@ export function bindUpload() {
   document.querySelectorAll("[data-origin]").forEach((button) => button.addEventListener("click", () => { origin = button.dataset.origin; operation = ""; fileInput.value = ""; updateModal(); }));
   document.querySelectorAll("[data-operation]").forEach((button) => button.addEventListener("click", () => { operation = button.dataset.operation; updateModal(); }));
   fileInput.addEventListener("change", updateModal);
+  agendaInput.addEventListener("input", () => { agendaInput.value = agendaInput.value.toUpperCase(); updateModal(); });
   ["dragenter", "dragover"].forEach((eventName) => dropzone.addEventListener(eventName, (event) => { event.preventDefault(); dropzone.classList.add("dragging"); }));
   ["dragleave", "drop"].forEach((eventName) => dropzone.addEventListener(eventName, (event) => { event.preventDefault(); dropzone.classList.remove("dragging"); }));
   dropzone.addEventListener("drop", (event) => setFile(event.dataTransfer.files[0]));
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const file = fileInput.files?.[0];
-    if (importing || !origin || !operation || !validFile(file)) return;
+    const agenda = agendaInput.value.trim().toUpperCase();
+    if (!agenda) { notify("Agenda é obrigatória.", "error"); agendaInput.focus(); return; }
+    if (!origin) { notify("Origem é obrigatória.", "error"); return; }
+    if (!operation) { notify("Operação é obrigatória.", "error"); return; }
+    if (!validFile(file)) { notify("Arquivo é obrigatório.", "error"); return; }
+    if (importing) return;
     importing = true; confirmButton.disabled = true; closeButton.disabled = true; confirmButton.textContent = "Importando...";
     try {
-      const created = await api("/api/conferences", { method: "POST", body: JSON.stringify({ filename: file.name, content_base64: await base64(file), origin, operation }) });
+      const created = await api("/api/conferences", { method: "POST", body: JSON.stringify({ filename: file.name, content_base64: await base64(file), agenda, origin, operation }) });
       modal.close(); resetModal(); notify(created.message); await load(created.public_id, created);
     } catch (error) {
       notify(error.message, "error");

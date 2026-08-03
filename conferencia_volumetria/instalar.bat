@@ -1,12 +1,12 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-py -3.14 --version >nul 2>&1
+py -3 --version >nul 2>&1
 if errorlevel 1 (
-  echo Python 3.14 nao foi encontrado. Instale o Python 3.14 e execute novamente.
+  echo Python 3.10 ou superior nao foi encontrado. Instale o Python e execute novamente.
   exit /b 1
 )
-if not exist ".venv\Scripts\python.exe" py -3.14 -m venv .venv
+if not exist ".venv\Scripts\python.exe" py -3 -m venv .venv
 if errorlevel 1 goto :erro
 call .venv\Scripts\activate.bat
 python -m pip install --upgrade pip

@@ -39,3 +39,4 @@ class ConferenceImport:
     content_base64: str
     origin: str
     operation: str
+    agenda: str = ""
