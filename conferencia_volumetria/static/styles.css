@@ -19,8 +19,8 @@
 body { margin: 0; }
 button, input { font: inherit; }
 button {
-  min-height: 42px;
-  padding: 9px 16px;
+  min-height: 36px;
+  padding: 7px 12px;
   border: 1px solid var(--blue);
   border-radius: 7px;
   color: #fff;
@@ -44,7 +44,7 @@ button.danger-outline {
 button.danger-button { background: var(--red); border-color: var(--red); }
 button.ready-to-finish { background: var(--green); border-color: var(--green); }
 
-.layout { max-width: 1180px; margin: auto; padding: 26px 20px 56px; }
+.layout { max-width: 1180px; margin: auto; padding: 16px 16px 32px; }
 .access-layout {
   min-height: 100vh;
   display: grid;
@@ -56,7 +56,7 @@ button.ready-to-finish { background: var(--green); border-color: var(--green); }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 10px;
 }
 h1, h2, h3 { margin: 0; }
 h1 { font-size: clamp(24px, 3vw, 31px); }
@@ -71,8 +71,8 @@ h3 { font-size: 16px; }
 }
 .helper { margin: 7px 0; color: var(--muted); font-size: 13px; }
 .card {
-  margin-top: 16px;
-  padding: 20px;
+  margin-top: 10px;
+  padding: 14px;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: #fff;
@@ -87,8 +87,8 @@ label {
 }
 input {
   width: 100%;
-  min-height: 42px;
-  padding: 9px 11px;
+  min-height: 36px;
+  padding: 7px 10px;
   border: 1px solid #b7c5d4;
   border-radius: 7px;
   color: #172033;
@@ -141,8 +141,8 @@ select { min-height: 42px; padding: 9px 11px; border: 1px solid #b7c5d4; border-
 .identity-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px 24px;
-  margin: 16px 0 12px;
+  gap: 6px 16px;
+  margin: 10px 0 8px;
   color: var(--muted);
   font-size: 13px;
 }
@@ -150,10 +150,10 @@ select { min-height: 42px; padding: 9px 11px; border: 1px solid #b7c5d4; border-
 .summary {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 10px;
+  gap: 7px;
 }
 .summary article {
-  padding: 13px;
+  padding: 9px;
   border: 1px solid #e0e7ef;
   border-radius: 8px;
   background: #f7f9fc;
@@ -163,13 +163,13 @@ select { min-height: 42px; padding: 9px 11px; border: 1px solid #b7c5d4; border-
   color: var(--muted);
   font-size: 12px;
 }
-.summary strong { display: block; margin-top: 4px; font-size: 23px; }
+.summary strong { display: block; margin-top: 2px; font-size: 20px; }
 .summary .danger-card strong { color: var(--red); }
 .summary .success-card strong { color: var(--green); }
 progress {
   width: 100%;
-  height: 12px;
-  margin: 14px 0 18px;
+  height: 9px;
+  margin: 9px 0 11px;
   accent-color: var(--green);
 }
 .scan-form {
@@ -179,17 +179,17 @@ progress {
   gap: 10px;
 }
 .scan-form input { font-family: Consolas, monospace; font-size: 17px; }
-.conference-actions { display: flex; flex-wrap: wrap; gap: 9px; margin: 17px 0; }
+.conference-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
 .lists-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.6fr) minmax(280px, .8fr);
-  gap: 18px;
-  margin-top: 20px;
+  gap: 12px;
+  margin-top: 12px;
 }
-.list-heading { margin-bottom: 8px; }
+.list-heading { margin-bottom: 5px; }
 .list-heading span { color: var(--muted); font-size: 12px; }
 .box-list, .extra-list {
-  max-height: 440px;
+  max-height: 400px;
   overflow-y: auto;
   margin: 0;
   padding: 0;
@@ -200,8 +200,8 @@ progress {
 .box-item, .extra-item {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
-  padding: 10px 12px;
+  gap: 8px;
+  padding: 7px 10px;
   border-bottom: 1px solid #e8edf3;
   font-family: Consolas, monospace;
   font-size: 13px;
@@ -220,7 +220,6 @@ progress {
 }
 .extra-item { color: var(--red); background: var(--red-bg); }
 .extra-item.resolved { color: var(--green); background: var(--green-bg); }
-.extra-item button { min-height: 32px; padding: 4px 9px; }
 
 dialog {
   width: min(92vw, 500px);

@@ -12,6 +12,8 @@ from conferencia.repositories.colaborador_repository import ColaboradorRepositor
 from conferencia.services.acesso_service import AcessoService
 from conferencia.infrastructure.session_manager import SessionManager
 from conferencia.services.conference_service import ConferenceService
+from conferencia.services.google_sheets_sync_service import GoogleSheetsSyncService
+from conferencia.services.automatic_report_service import AutomaticReportService
 from conferencia.web import ApplicationHandler
 
 
@@ -29,6 +31,8 @@ def main() -> None:
     ApplicationHandler.acesso_service = AcessoService(ColaboradorRepository(database))
     ApplicationHandler.sessions = SessionManager()
     ApplicationHandler.max_json_bytes = settings.max_json_bytes
+    ApplicationHandler.google_sync_service = GoogleSheetsSyncService(database, settings)
+    ApplicationHandler.automatic_report_service = AutomaticReportService(settings.max_upload_bytes)
     server = ThreadingHTTPServer((args.host, args.port), ApplicationHandler)
     print(f"Conferência de Volumetria disponível em http://{args.host}:{args.port}")
     try:

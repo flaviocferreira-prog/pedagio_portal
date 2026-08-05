@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from conferencia.domain.entities import CollaboratorContext, ConferenceImport
 from conferencia.services.conference_service import ConferenceService, ValidationError
+from conferencia.services.automatic_report_service import AutomaticReportService
+from base64 import b64encode
 
 
 class ConferenceController:
@@ -15,10 +17,10 @@ class ConferenceController:
     ) -> dict:
         filename = payload.get("filename")
         content_base64 = payload.get("content_base64")
-        agenda = payload.get("agenda")
+        agenda = payload.get("agenda", "")
         origin = payload.get("origin")
         operation = payload.get("operation")
-        if not all(isinstance(value, str) for value in (filename, content_base64, agenda, origin, operation)):
+        if not all(isinstance(value, str) for value in (filename, content_base64, origin, operation)) or not isinstance(agenda, str):
             raise ValidationError(
                 "Informe o nome e o conteúdo do arquivo para carregar o palete."
             )
@@ -31,6 +33,15 @@ class ConferenceController:
             operation=operation,
         )
         return self.service.import_pallet(command)
+
+    def import_automatic_pallet(
+        self, payload: dict[str, object], collaborator: CollaboratorContext, reports: AutomaticReportService
+    ) -> dict:
+        filename, content = reports.read(payload.get("automatic_file_id"))
+        command_payload = dict(payload)
+        command_payload["filename"] = filename
+        command_payload["content_base64"] = b64encode(content).decode("ascii")
+        return self.import_pallet(command_payload, collaborator)
 
     def get_pallet(
         self, public_id: str, collaborator: CollaboratorContext
@@ -76,8 +87,3 @@ class ConferenceController:
         self, public_id: str, payload: dict[str, object], collaborator: CollaboratorContext
     ) -> dict:
         return self.service.authorize_reconference(public_id, payload.get("justificativa"), collaborator)
-
-    def sync_pallet(
-        self, public_id: str, collaborator: CollaboratorContext
-    ) -> dict:
-        return self.service.sync_pallet(public_id, collaborator)

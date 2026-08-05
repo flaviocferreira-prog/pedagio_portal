@@ -8,6 +8,12 @@ export class ApiError extends Error {
   }
 }
 
+export const routes = Object.freeze({
+  activeConference: "/api/conferences/active",
+  pendingSynchronizations: "/api/sincronizacao/pendentes",
+  preparePendingSynchronizations: "/sincronizacao/pendentes/preparar/",
+});
+
 export async function api(url, options = {}) {
   let response;
   const headers = new Headers(options.headers || {});

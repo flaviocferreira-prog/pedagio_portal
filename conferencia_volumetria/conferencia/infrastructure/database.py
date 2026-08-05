@@ -93,6 +93,24 @@ class SQLiteDatabase:
             if 12 not in applied:
                 self._migration_012_agenda_importacao(connection)
                 self._record(connection, 12, "agenda obrigatoria da importacao")
+            if 13 not in applied:
+                self._migration_013_cancelamento_de_tentativa(connection)
+                self._record(connection, 13, "cancelamento terminal de tentativa")
+            if 14 not in applied:
+                self._migration_014_google_sheets_sync(connection)
+                self._record(connection, 14, "sincronizacao assinada com Google Sheets")
+            if 15 not in applied:
+                self._migration_015_sync_attempt_contract(connection)
+                self._record(connection, 15, "tentativas de sincronizacao vinculadas por nonce")
+            if 16 not in applied:
+                self._migration_016_manual_sync_statuses(connection)
+                self._record(connection, 16, "sincronizacao manual pendente e recuperavel")
+            if 17 not in applied:
+                self._migration_017_expected_carton_class(connection)
+                self._record(connection, 17, "classe por caixa esperada")
+            if 18 not in applied:
+                self._migration_018_repeated_expected_cartons(connection)
+                self._record(connection, 18, "ocorrencias repetidas de caixa esperada")
             violations = connection.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise RuntimeError("A migração de caixa estoque violou chaves estrangeiras.")
@@ -134,8 +152,7 @@ class SQLiteDatabase:
                 started_at TEXT,
                 finished_at TEXT,
                 duration_seconds INTEGER,
-                final_justification TEXT,
-                sync_status TEXT NOT NULL DEFAULT 'NOT_READY'
+                final_justification TEXT
             );
             CREATE TABLE IF NOT EXISTS expected_cartons (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,9 +191,6 @@ class SQLiteDatabase:
         SQLiteDatabase._add_column_if_missing(connection, "pallets", "finished_at", "TEXT")
         SQLiteDatabase._add_column_if_missing(connection, "pallets", "duration_seconds", "INTEGER")
         SQLiteDatabase._add_column_if_missing(connection, "pallets", "final_justification", "TEXT")
-        SQLiteDatabase._add_column_if_missing(
-            connection, "pallets", "sync_status", "TEXT NOT NULL DEFAULT 'NOT_READY'"
-        )
 
     @staticmethod
     def _migration_002_attempts_and_audit(connection: sqlite3.Connection) -> None:
@@ -661,9 +675,8 @@ class SQLiteDatabase:
               )
             """
         )
-        # Um fingerprint global impedia reimportar legitimamente um arquivo
-        # depois do encerramento. A unicidade de conferência aberta abaixo e a
-        # transação de criação são a proteção correta contra duplo clique.
+        # A unicidade de conferência aberta e a transação de criação protegem
+        # contra duplo clique sem impedir uma nova importação após encerramento.
         connection.execute("DROP INDEX IF EXISTS idx_pallets_source_fingerprint")
         connection.execute(
             """
@@ -679,6 +692,125 @@ class SQLiteDatabase:
             """
         )
 
+    @staticmethod
+    def _migration_013_cancelamento_de_tentativa(connection: sqlite3.Connection) -> None:
+        """Inclui o estado terminal CANCELLED sem descartar o histórico."""
+        connection.executescript(
+            """
+            CREATE TABLE conference_attempts_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pallet_id INTEGER NOT NULL REFERENCES pallets(id) ON DELETE RESTRICT,
+                attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+                status TEXT NOT NULL CHECK(status IN ('READY', 'IN_PROGRESS', 'RESTARTED', 'COMPLETED', 'CANCELLED')),
+                started_at TEXT,
+                finished_at TEXT,
+                started_by_collaborator_id INTEGER REFERENCES colaboradores(id),
+                restarted_by_collaborator_id INTEGER REFERENCES colaboradores(id),
+                finished_by_collaborator_id INTEGER REFERENCES colaboradores(id),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(pallet_id, attempt_number)
+            );
+            INSERT INTO conference_attempts_new
+            SELECT * FROM conference_attempts;
+
+            CREATE TABLE attempt_confirmations_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id INTEGER NOT NULL REFERENCES conference_attempts_new(id) ON DELETE RESTRICT,
+                expected_carton_id INTEGER NOT NULL REFERENCES expected_cartons(id) ON DELETE RESTRICT,
+                collaborator_id INTEGER NOT NULL REFERENCES colaboradores(id) ON DELETE RESTRICT,
+                confirmed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(attempt_id, expected_carton_id)
+            );
+            INSERT INTO attempt_confirmations_new
+            SELECT * FROM attempt_confirmations;
+
+            DROP TABLE attempt_confirmations;
+            DROP TABLE conference_attempts;
+            ALTER TABLE conference_attempts_new RENAME TO conference_attempts;
+            ALTER TABLE attempt_confirmations_new RENAME TO attempt_confirmations;
+            CREATE INDEX IF NOT EXISTS idx_attempts_pallet ON conference_attempts(pallet_id, attempt_number);
+            CREATE INDEX IF NOT EXISTS idx_confirmations_attempt ON attempt_confirmations(attempt_id);
+            """
+        )
+
+    @staticmethod
+    def _migration_014_google_sheets_sync(connection: sqlite3.Connection) -> None:
+        for column, definition in (
+            ("status_sincronizacao", "TEXT NOT NULL DEFAULT 'PENDENTE'"),
+            ("sincronizacao_iniciada_em", "TEXT"),
+            ("sincronizado_em", "TEXT"),
+            ("tentativas_sincronizacao", "INTEGER NOT NULL DEFAULT 0"),
+            ("ultimo_erro_sincronizacao", "TEXT"),
+            ("recibo_sincronizacao", "TEXT"),
+        ):
+            SQLiteDatabase._add_column_if_missing(connection, "pallets", column, definition)
+        connection.execute(
+            """
+            UPDATE pallets
+            SET status_sincronizacao = CASE
+                WHEN status_sincronizacao IN ('PENDENTE', 'SINCRONIZANDO', 'SINCRONIZADO', 'ERRO')
+                    THEN status_sincronizacao
+                ELSE 'PENDENTE'
+            END
+            """
+        )
+
+    @staticmethod
+    def _migration_015_sync_attempt_contract(connection: sqlite3.Connection) -> None:
+        """Keeps old database files compatible while making attempts authoritative."""
+        for column, definition in (
+            ("attempt_id", "TEXT"),
+            ("conference_id", "TEXT"),
+            ("nonce", "TEXT"),
+            ("popup_token", "TEXT"),
+            ("error_code", "TEXT"),
+            ("receipt", "TEXT"),
+            ("result_consumed_at", "TEXT"),
+            ("reconciled", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            SQLiteDatabase._add_column_if_missing(
+                connection, "synchronization_attempts", column, definition
+            )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_attempts_attempt_id
+            ON synchronization_attempts(attempt_id)
+            WHERE attempt_id IS NOT NULL
+            """
+        )
+    @staticmethod
+    def _migration_016_manual_sync_statuses(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            UPDATE pallets
+            SET status_sincronizacao = 'PENDENTE'
+            WHERE conference_status = 'FINALIZADA'
+              AND status_sincronizacao IN ('ERRO', '', NULL)
+            """
+        )
+
+    @staticmethod
+    def _migration_017_expected_carton_class(connection: sqlite3.Connection) -> None:
+        SQLiteDatabase._add_column_if_missing(connection, "expected_cartons", "ds_classe", "TEXT")
+
+    @staticmethod
+    def _migration_018_repeated_expected_cartons(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE expected_cartons_repeated (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pallet_id INTEGER NOT NULL REFERENCES pallets(id) ON DELETE RESTRICT,
+                code TEXT NOT NULL, ds_classe TEXT,
+                status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'CONFIRMED')),
+                confirmed_at TEXT, confirmed_by_collaborator_id INTEGER REFERENCES colaboradores(id), confirmed_attempt_id INTEGER
+            );
+            INSERT INTO expected_cartons_repeated(id,pallet_id,code,ds_classe,status,confirmed_at,confirmed_by_collaborator_id,confirmed_attempt_id)
+            SELECT id,pallet_id,code,ds_classe,status,confirmed_at,confirmed_by_collaborator_id,confirmed_attempt_id FROM expected_cartons;
+            DROP TABLE expected_cartons;
+            ALTER TABLE expected_cartons_repeated RENAME TO expected_cartons;
+            CREATE INDEX idx_expected_cartons_pallet ON expected_cartons(pallet_id);
+            """
+        )
     @staticmethod
     def _add_column_if_missing(
         connection: sqlite3.Connection, table: str, column: str, definition: str

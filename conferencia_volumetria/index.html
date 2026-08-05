@@ -13,13 +13,18 @@
                 <p class="eyebrow">CONFERÊNCIA FÍSICA</p>
                 <h1>Conferência de Volumetria</h1>
             </div>
-            <button id="logout-button" class="secondary" type="button">Trocar colaborador</button>
+            <button id="logout-button" class="secondary icon-button" type="button" title="Trocar colaborador" aria-label="Trocar colaborador">⇄</button>
         </header>
 
         <div id="notice" class="notice" aria-live="polite"></div>
 
         <section id="upload-card" class="card" hidden>
             <button id="new-import-button" type="button">Nova importação</button>
+        </section>
+        <section id="sync-card" class="card sync-card" hidden>
+            <span id="pending-sync-count" class="helper">0 conferências pendentes de sincronização</span>
+            <button id="sync-pending-button" class="secondary" type="button" disabled>Sincronizar pendentes</button>
+            <span id="pending-sync-result" class="helper" aria-live="polite"></span>
         </section>
 
         <section id="conference" class="card" hidden>
@@ -53,6 +58,7 @@
                 <article class="danger-card"><span>Divergentes</span><strong id="summary-surplus">0</strong></article>
                 <article><span>Duplicadas</span><strong id="summary-duplicate">0</strong></article>
                 <article><span>Percentual</span><strong id="summary-coverage">0%</strong></article>
+                <article><span>Classe do palete</span><strong id="summary-pallet-class">NÃO INFORMADO</strong></article>
             </div>
 
             <progress id="progress" value="0" max="100" aria-label="Progresso da conferência"></progress>
@@ -63,7 +69,6 @@
                     <input id="carton-code" autocomplete="off" required
                            aria-describedby="scan-helper">
                 </label>
-                <button type="submit">Ler caixa</button>
             </form>
             <p id="scan-helper" class="helper">Bipe ou cole o código; a conferência é automática.</p>
             <p id="completion-notice" class="notice warning" hidden>100% conferido — aguardando finalização</p>
@@ -72,8 +77,6 @@
             <div class="conference-actions">
                 <button id="finish-button" type="button">Finalizar conferência</button>
                 <button id="cancel-conference-button" class="danger-button" type="button">Cancelar conferência</button>
-                <button id="print-button" class="secondary" type="button" hidden>Imprimir</button>
-                <button id="sync-button" class="secondary" type="button" hidden>Sincronizar</button>
                 <button id="authorize-reconference-button" class="danger-outline" type="button" hidden>Autorizar reconferência</button>
             </div>
 
@@ -108,21 +111,22 @@
         <dialog id="import-modal" aria-labelledby="import-title">
             <form id="import-form" method="dialog">
                 <div class="dialog-heading"><h2 id="import-title">Nova importação</h2><button id="import-close" class="close-button" type="button" aria-label="Fechar">×</button></div>
-                <label for="import-agenda">1. Insira a agenda<input id="import-agenda" name="agenda" autocomplete="off" required></label>
-                <p class="helper">2. Selecione a origem</p>
+                <p class="helper">1. Selecione a origem</p>
                 <div class="choice-grid" role="radiogroup" aria-label="Origem">
                     <button type="button" class="choice-button" data-origin="PORTAL">Portal</button>
                     <button type="button" class="choice-button" data-origin="TL">TL</button>
                 </div>
-                <p class="helper">3. Selecione a operação</p>
+                <p class="helper">2. Selecione a operação</p>
                 <div id="operation-choices" class="choice-grid" role="radiogroup" aria-label="Operação" aria-disabled="true">
                     <button type="button" class="choice-button" data-operation="DIGITAL" disabled>Digital</button>
                     <button type="button" class="choice-button" data-operation="NIKESTORE" disabled>Nike Store</button>
                     <button type="button" class="choice-button" data-operation="CROSS" disabled>Cross</button>
                 </div>
-                <label for="pallet-file">4. Arquivo<input id="pallet-file" name="file" type="file" accept=".xlsx,.csv" disabled required></label>
+                <p class="helper">3. Arquivo</p>
+                <p id="automatic-file" class="helper" aria-live="polite"></p>
+                <label for="pallet-file">Escolher arquivo<input id="pallet-file" name="file" type="file" accept=".xlsx,.csv" disabled></label>
                 <div id="import-dropzone" class="dropzone" tabindex="0">Arraste o arquivo aqui ou use o seletor acima.</div>
-                <p id="import-summary" class="helper">Preencha agenda, origem, operação e arquivo para revisar a importação.</p>
+                <p id="import-summary" class="helper">Selecione origem, operação e arquivo para revisar a importação.</p>
                 <div class="dialog-actions"><button id="import-confirm" type="submit" disabled>Importar e Iniciar a Conferência</button></div>
             </form>
         </dialog>

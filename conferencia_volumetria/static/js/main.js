@@ -16,4 +16,6 @@ document.querySelector("#logout-button").addEventListener("click", async () => {
   }
 });
 
-loadActiveConference().catch((error) => notify(error.message, "error"));
+const initialLoad = loadActiveConference();
+
+initialLoad.catch((error) => notify(error.message, "error"));

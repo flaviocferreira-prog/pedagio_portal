@@ -19,6 +19,7 @@ from conferencia.readers.excel_reader import PalletFileImporter
 from conferencia.repositories.pallet_repository import (
     ActiveConferenceError,
     AmbiguousBoxCodeError,
+    ContentInProgressError,
     PalletRepository,
     PendingConferenceError,
     RepositoryStateError,
@@ -76,7 +77,7 @@ class ConferenceService:
 
     def import_pallet(self, import_data: ConferenceImport) -> dict:
         collaborator = self._validate_collaborator(import_data.collaborator)
-        agenda = self._required_upper(import_data.agenda, "Agenda")
+        agenda = str(import_data.agenda or "").strip().upper()
         origin = self._choice(import_data.origin, self.ORIGINS, "origem")
         operation = self._choice(import_data.operation, self.OPERATIONS, "operação")
         extension = self._safe_extension(import_data.filename)
@@ -95,13 +96,15 @@ class ConferenceService:
             ) as temporary_file:
                 temporary_file.write(content)
                 temporary_path = Path(temporary_file.name)
-            carton_codes = self.excel_reader.read_carton_codes(
-                temporary_path, extension
-            )
+            read_items = getattr(self.excel_reader, "read_expected_items", None)
+            expected_items = read_items(temporary_path, extension) if read_items else [
+                {"caixa_estoque": code, "ds_classe": ""}
+                for code in self.excel_reader.read_carton_codes(temporary_path, extension)
+            ]
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
-        carton_codes = [normalize_caixa_estoque(code) for code in carton_codes]
+        carton_codes = [normalize_caixa_estoque(item["caixa_estoque"]) for item in expected_items]
         carton_codes = [code for code in carton_codes if code]
         if not carton_codes:
             raise ValidationError("O arquivo não possui caixas estoque válidas.")
@@ -116,7 +119,7 @@ class ConferenceService:
                 public_id,
                 collaborator,
                 import_data.filename,
-                carton_codes,
+                expected_items,
                 source_fingerprint,
                 agenda,
                 origin,
@@ -126,6 +129,8 @@ class ConferenceService:
             )
         except ActiveConferenceError as error:
             raise self._active_conference_error(error.public_id) from error
+        except ContentInProgressError as error:
+            raise self._content_in_progress_error(error) from error
         except sqlite3.IntegrityError as error:
             raise ConflictError(
                 "Não foi possível criar a conferência sem duplicidades.",
@@ -346,23 +351,6 @@ class ConferenceService:
         result["message"] = "ConferÃªncia cancelada. O histÃ³rico foi preservado e uma nova importaÃ§Ã£o estÃ¡ liberada."
         return result
 
-    def sync_pallet(
-        self, public_id: str, collaborator: CollaboratorContext
-    ) -> dict:
-        actor, pallet = self._pallet_for_collaborator(public_id, collaborator)
-        conference = self.get_pallet(public_id)
-        if conference["workflow_status"] != "FINALIZADA":
-            raise ConflictError(
-                "A sincronização só é permitida após a finalização."
-            )
-        message = "Integração com Google Sheets ainda não está configurada."
-        self.repository.record_sync_not_configured(pallet["id"], actor, message)
-        return {
-            "public_id": conference["public_id"],
-            "sync_status": "NOT_CONFIGURED",
-            "message": message,
-        }
-
     def _find(self, public_id: str) -> sqlite3.Row:
         pallet = self.repository.find_by_public_id(
             self._required(public_id, "ID público da conferência")
@@ -386,6 +374,22 @@ class ConferenceService:
             "Já existe uma conferência ativa. Finalize ou cancele a conferência atual antes de iniciar uma nova importação.",
             code="CONFERENCIA_ATIVA",
             details={"public_id": public_id},
+        )
+
+    @staticmethod
+    def _content_in_progress_error(error: ContentInProgressError) -> ConflictError:
+        owner = error.owner_name or "outro colaborador"
+        registration = error.owner_registration or "não informada"
+        timestamp = PalletRepository._format_local_datetime(
+            error.started_at or error.imported_at
+        )
+        message = f"Este conteúdo já está sendo conferido por {owner}. Matrícula: {registration}."
+        if timestamp:
+            message += f" Iniciada/importada em: {timestamp}."
+        return ConflictError(
+            message,
+            code="CONTEUDO_EM_CONFERENCIA",
+            details={"owner_registration": registration, "started_at": timestamp},
         )
 
     @staticmethod

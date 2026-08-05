@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 from conferencia.domain.box_codes import comparison_code_without_leading_zeros, normalize_caixa_estoque
 from conferencia.domain.entities import (
@@ -12,6 +11,10 @@ from conferencia.domain.entities import (
     ScanClassification,
 )
 from conferencia.infrastructure.database import SQLiteDatabase
+from conferencia.infrastructure.timezones import SAO_PAULO_TIMEZONE
+from conferencia.repositories.conference_attempt_repository import ConferenceAttemptRepository
+from conferencia.repositories.conference_audit_repository import ConferenceAuditRepository
+from conferencia.repositories.divergence_repository import DivergenceRepository
 
 
 class RepositoryStateError(Exception):
@@ -36,6 +39,18 @@ class ActiveConferenceError(Exception):
         self.public_id = public_id
 
 
+class ContentInProgressError(Exception):
+    def __init__(
+        self, owner_name: str, owner_registration: str, started_at: str | None,
+        imported_at: str | None,
+    ) -> None:
+        super().__init__("CONTENT_IN_PROGRESS")
+        self.owner_name = owner_name
+        self.owner_registration = owner_registration
+        self.started_at = started_at
+        self.imported_at = imported_at
+
+
 class AmbiguousBoxCodeError(Exception):
     def __init__(self, matches: list[str]) -> None:
         super().__init__("AMBIGUOUS_BOX_CODE")
@@ -45,6 +60,9 @@ class AmbiguousBoxCodeError(Exception):
 class PalletRepository:
     def __init__(self, database: SQLiteDatabase) -> None:
         self.database = database
+        self.attempts = ConferenceAttemptRepository()
+        self.divergences = DivergenceRepository()
+        self.audit = ConferenceAuditRepository()
 
     def create(
         self,
@@ -67,21 +85,29 @@ class PalletRepository:
                 return {"action": "already_completed", "public_id": finished["public_id"]}
             opened = next((row for row in history if row["conference_status"] == ConferenceStatus.OPEN), None)
             if opened is not None:
+                if opened["created_by_collaborator_id"] != collaborator.id:
+                    raise ContentInProgressError(
+                        str(opened["owner_name"] or ""),
+                        str(opened["owner_registration"] or ""),
+                        opened["started_at"],
+                        opened["imported_at"],
+                    )
                 self._audit(connection, opened["id"], collaborator, "IMPORT_OPEN_CONTENT", content_hash, "RESUMED")
                 return {"action": "resumed", "public_id": opened["public_id"]}
             active = self._active_for_collaborator(connection, collaborator.id)
             if active is not None:
                 raise ActiveConferenceError(active["public_id"])
             previous = next((row for row in history if row["conference_status"] == ConferenceStatus.CANCELLED), None)
+            imported_at = self._now(connection)
             cursor = connection.execute(
                 """
                 INSERT INTO pallets(
                     code, public_id, collaborator_id, source_filename,
                     source_fingerprint, import_agenda, import_origin, import_operation, imported_shift,
-                    created_by_collaborator_id, total_expected,
+                    created_by_collaborator_id, total_expected, imported_at,
                     conference_status, print_status, content_hash, previous_conference_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     public_id,
@@ -95,6 +121,7 @@ class PalletRepository:
                     shift,
                     collaborator.id,
                     len(carton_codes),
+                    imported_at,
                     ConferenceStatus.OPEN,
                     "AVAILABLE",
                     content_hash,
@@ -103,19 +130,13 @@ class PalletRepository:
             )
             pallet_id = int(cursor.lastrowid)
             connection.executemany(
-                "INSERT INTO expected_cartons(pallet_id, code) VALUES (?, ?)",
+                "INSERT INTO expected_cartons(pallet_id, code, ds_classe) VALUES (?, ?, ?)",
                 [
-                    (pallet_id, normalize_caixa_estoque(carton_code))
-                    for carton_code in carton_codes
+                    (pallet_id, normalize_caixa_estoque(item["caixa_estoque"]), normalize_caixa_estoque(item.get("ds_classe", "")).upper() or None)
+                    for item in carton_codes
                 ],
             )
-            connection.execute(
-                """
-                INSERT INTO conference_attempts(pallet_id, attempt_number, status)
-                VALUES (?, 1, 'READY')
-                """,
-                (pallet_id,),
-            )
+            self.attempts.create_ready(connection, pallet_id)
             action = "created_after_cancellation" if previous is not None else "created"
             self._audit(
                 connection, pallet_id, collaborator,
@@ -134,12 +155,16 @@ class PalletRepository:
     ) -> list[sqlite3.Row]:
         return connection.execute(
             """
-            SELECT id, public_id, conference_status
-            FROM pallets
-            WHERE content_hash = ?
-            ORDER BY CASE conference_status
+            SELECT p.id, p.public_id, p.conference_status,
+                   p.created_by_collaborator_id, p.imported_at, p.started_at,
+                   COALESCE(c.matricula, p.collaborator_id) AS owner_registration,
+                   COALESCE(c.nome, '') AS owner_name
+            FROM pallets p
+            LEFT JOIN colaboradores c ON c.id = p.created_by_collaborator_id
+            WHERE p.content_hash = ?
+            ORDER BY CASE p.conference_status
                 WHEN 'FINALIZADA' THEN 1 WHEN 'EM_ABERTO' THEN 2
-                WHEN 'CANCELADA' THEN 3 ELSE 4 END, id DESC
+                WHEN 'CANCELADA' THEN 3 ELSE 4 END, p.id DESC
             """,
             (content_hash,),
         ).fetchall()
@@ -154,16 +179,7 @@ class PalletRepository:
         result: str,
         justification: str | None = None,
     ) -> None:
-        connection.execute(
-            """
-            INSERT INTO conference_audit_events(
-                pallet_id, collaborator_id, registration, profile, action,
-                content_hash, justification, result, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (pallet_id, collaborator.id, collaborator.registration, collaborator.shift,
-             action, content_hash, justification, result, PalletRepository._now(connection)),
-        )
+        ConferenceAuditRepository().record(connection, pallet_id, collaborator, action, content_hash, result, PalletRepository._now(connection), justification)
 
     def find_active_by_collaborator(self, collaborator_id: int) -> sqlite3.Row | None:
         with self.database.connection() as connection:
@@ -184,9 +200,9 @@ class PalletRepository:
             active = self._active_for_collaborator(connection, collaborator.id)
             if active is not None:
                 raise ActiveConferenceError(active["public_id"])
-            codes = [row["code"] for row in connection.execute(
-                "SELECT code FROM expected_cartons WHERE pallet_id = ? ORDER BY id", (previous["id"],)
-            )]
+            codes = list(connection.execute(
+                "SELECT code, ds_classe FROM expected_cartons WHERE pallet_id = ? ORDER BY id", (previous["id"],)
+            ))
             now = self._now(connection)
             cursor = connection.execute(
                 """
@@ -196,25 +212,20 @@ class PalletRepository:
                     created_by_collaborator_id, total_expected, updated_at, status,
                     conference_status, print_status, content_hash, previous_conference_id,
                     is_reconference, reconference_authorized_by, reconference_reason,
-                    reconference_authorized_at, started_at, started_by_collaborator_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_PROGRESS', ?, 'AVAILABLE', ?, ?, 1, ?, ?, ?, ?, ?)
+                    reconference_authorized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, 'AVAILABLE', ?, ?, 1, ?, ?, ?)
                 """,
                 (public_id, public_id, collaborator.registration, previous["source_filename"],
                  previous["source_fingerprint"], previous["import_origin"], previous["import_operation"],
                  collaborator.shift, now, collaborator.id, len(codes), now, ConferenceStatus.OPEN,
-                 previous["content_hash"], previous["id"], collaborator.id, reason, now, now, collaborator.id),
+                 previous["content_hash"], previous["id"], collaborator.id, reason, now),
             )
             pallet_id = int(cursor.lastrowid)
             connection.executemany(
-                "INSERT INTO expected_cartons(pallet_id, code) VALUES (?, ?)",
-                [(pallet_id, normalize_caixa_estoque(code)) for code in codes],
+                "INSERT INTO expected_cartons(pallet_id, code, ds_classe) VALUES (?, ?, ?)",
+                [(pallet_id, normalize_caixa_estoque(row["code"]), row["ds_classe"]) for row in codes],
             )
-            connection.execute(
-                """INSERT INTO conference_attempts(
-                    pallet_id, attempt_number, status, started_at, started_by_collaborator_id
-                ) VALUES (?, 1, 'IN_PROGRESS', ?, ?)""",
-                (pallet_id, now, collaborator.id),
-            )
+            self.attempts.create_ready(connection, pallet_id)
             self._audit(connection, pallet_id, collaborator, "RECONFERENCIA_AUTORIZADA",
                         previous["content_hash"], "CREATED", reason)
             return public_id
@@ -252,7 +263,7 @@ class PalletRepository:
                 """
                 SELECT id, public_id, collaborator_id, source_filename, status,
                        created_at, started_at, finished_at, duration_seconds,
-                       sync_status, final_justification,
+                       final_justification,
                        created_by_collaborator_id, started_by_collaborator_id,
                        finished_by_collaborator_id, cancelled_at,
                        cancelled_by_collaborator_id, import_origin, import_operation,
@@ -286,7 +297,7 @@ class PalletRepository:
                 raise RuntimeError("Conferência sem tentativa operacional.")
             cartons = connection.execute(
                 """
-                SELECT code, status, confirmed_at
+                SELECT code, ds_classe, status, confirmed_at
                 FROM expected_cartons
                 WHERE pallet_id = ?
                 ORDER BY id
@@ -361,6 +372,7 @@ class PalletRepository:
             },
             "source_filename": pallet["source_filename"],
             "content_hash": pallet["content_hash"],
+            "pallet_class": self._pallet_class(cartons),
             "previous_conference_id": pallet["previous_conference_id"],
             "is_reconference": bool(pallet["is_reconference"]),
             "reconference_reason": pallet["reconference_reason"],
@@ -389,7 +401,15 @@ class PalletRepository:
             "duration_seconds": pallet["duration_seconds"],
             "productivity_boxes_per_hour": pallet["productivity_boxes_per_hour"],
             "print_status": pallet["print_status"],
-            "sync_status": pallet["sync_status"],
+            "synchronization": {
+                "status": pallet["status_sincronizacao"],
+                "started_at": self._format_local_datetime(pallet["sincronizacao_iniciada_em"]),
+                "started_at_iso": pallet["sincronizacao_iniciada_em"],
+                "synchronized_at": self._format_local_datetime(pallet["sincronizado_em"]),
+                "synchronized_at_iso": pallet["sincronizado_em"],
+                "attempts": int(pallet["tentativas_sincronizacao"] or 0),
+                "last_error": pallet["ultimo_erro_sincronizacao"],
+            },
             "final_justification": pallet["final_justification"],
             "active_attempt": {
                 "id": attempt["id"] if attempt else None,
@@ -407,6 +427,7 @@ class PalletRepository:
             "cartons": [
                 {
                     "caixa_estoque": normalize_caixa_estoque(row["code"]),
+                    "ds_classe": normalize_caixa_estoque(row["ds_classe"]).upper() or "NÃO INFORMADO",
                     "status": row["status"],
                     "confirmed_at": row["confirmed_at"],
                 }
@@ -476,21 +497,14 @@ class PalletRepository:
                 SET status = 'COMPLETED_WITH_DIVERGENCE', conference_status = ?,
                     cancelled_at = ?, cancelled_by_collaborator_id = ?, finished_at = ?,
                     duration_seconds = MAX(0, CAST((julianday(?) - julianday(COALESCE(started_at, imported_at, created_at))) * 86400 AS INTEGER)),
-                    final_justification = 'CANCELADA', sync_status = 'NOT_READY', updated_at = ?
+                    final_justification = 'CANCELADA', updated_at = ?
                 WHERE id = ? AND conference_status = ?
                 """,
                 (ConferenceStatus.CANCELLED, now, collaborator.id, now, now, now, pallet_id, ConferenceStatus.OPEN),
             )
             if updated.rowcount != 1:
                 raise RepositoryStateError("CHANGED")
-            connection.execute(
-                """
-                UPDATE conference_attempts SET status = 'COMPLETED', finished_at = ?,
-                    finished_by_collaborator_id = ?
-                WHERE pallet_id = ? AND status = 'IN_PROGRESS'
-                """,
-                (now, collaborator.id, pallet_id),
-            )
+            self.attempts.cancel(connection, pallet_id, now, collaborator.id)
 
     def start(self, pallet_id: int, collaborator: CollaboratorContext) -> None:
         """Start exactly once after the client has rendered the imported boxes."""
@@ -510,22 +524,15 @@ class PalletRepository:
             updated = connection.execute(
                 """
                 UPDATE pallets
-                SET status = 'IN_PROGRESS', imported_at = ?, started_at = ?,
+                SET status = 'IN_PROGRESS', started_at = ?,
                     started_by_collaborator_id = ?, updated_at = ?
                 WHERE id = ? AND conference_status = ? AND started_at IS NULL
                 """,
-                (now, now, collaborator.id, now, pallet_id, ConferenceStatus.OPEN),
+                (now, collaborator.id, now, pallet_id, ConferenceStatus.OPEN),
             )
             if updated.rowcount != 1:
                 raise RepositoryStateError("CHANGED")
-            connection.execute(
-                """
-                UPDATE conference_attempts
-                SET status = 'IN_PROGRESS', started_at = ?, started_by_collaborator_id = ?
-                WHERE pallet_id = ? AND attempt_number = 1 AND status = 'READY'
-                """,
-                (now, collaborator.id, pallet_id),
-            )
+            self.attempts.start(connection, pallet_id, now, collaborator.id)
 
     def process_scan(
         self,
@@ -550,14 +557,15 @@ class PalletRepository:
             attempt = self._latest_attempt(connection, pallet_id)
             if attempt is None or attempt["status"] != "IN_PROGRESS":
                 raise RepositoryStateError("NOT_STARTED")
-            expected = connection.execute(
+            expected_rows = connection.execute(
                 """
                 SELECT id, code, status, confirmed_at
                 FROM expected_cartons
                 WHERE pallet_id = ? AND code = ?
                 """,
                 (pallet_id, code),
-            ).fetchone()
+            ).fetchall()
+            expected = expected_rows[0] if expected_rows else None
             match_type: str | None = "EXACT" if expected is not None else None
             if expected is None:
                 comparison_code = comparison_code_without_leading_zeros(code)
@@ -573,23 +581,26 @@ class PalletRepository:
                     ).fetchall()
                     if comparison_code_without_leading_zeros(row["code"]) == comparison_code
                 ]
-                if len(normalized_matches) > 1:
-                    raise AmbiguousBoxCodeError([str(row["code"]) for row in normalized_matches])
+                distinct_codes = list(dict.fromkeys(str(row["code"]) for row in normalized_matches))
+                if len(distinct_codes) > 1:
+                    raise AmbiguousBoxCodeError(distinct_codes)
                 if normalized_matches:
                     expected = normalized_matches[0]
+                    expected_rows = normalized_matches
                     match_type = "NORMALIZED"
             now = self._now(connection)
             first_seen: str | None = None
-            if expected is not None and expected["status"] == CartonStatus.PENDING:
+            pending_rows = [row for row in expected_rows if row["status"] == CartonStatus.PENDING]
+            if expected is not None and pending_rows:
                 try:
-                    connection.execute(
+                    connection.executemany(
                         """
                         INSERT INTO attempt_confirmations(
                             attempt_id, expected_carton_id, collaborator_id, confirmed_at
                         )
                         VALUES (?, ?, ?, ?)
                         """,
-                        (attempt["id"], expected["id"], collaborator.id, now),
+                        [(attempt["id"], row["id"], collaborator.id, now) for row in pending_rows],
                     )
                 except sqlite3.IntegrityError:
                     classification = ScanClassification.DUPLICATE
@@ -607,23 +618,23 @@ class PalletRepository:
                         UPDATE expected_cartons
                         SET status = ?, confirmed_at = ?,
                             confirmed_by_collaborator_id = ?, confirmed_attempt_id = ?
-                        WHERE id = ? AND status = ?
+                        WHERE pallet_id = ? AND code = ? AND status = ?
                         """,
                         (
                             CartonStatus.CONFIRMED,
                             now,
                             collaborator.id,
                             attempt["id"],
-                            expected["id"],
+                            pallet_id, expected["code"],
                             CartonStatus.PENDING,
                         ),
                     )
                     classification = (
                         ScanClassification.MATCHED
-                        if updated.rowcount == 1
+                        if updated.rowcount == len(pending_rows)
                         else ScanClassification.DUPLICATE
                     )
-                    first_seen = None if updated.rowcount == 1 else expected["confirmed_at"]
+                    first_seen = None if updated.rowcount == len(pending_rows) else expected["confirmed_at"]
                     if classification == ScanClassification.DUPLICATE:
                         self._record_divergence(
                             connection, pallet_id, attempt["id"], "DUPLICIDADE", code,
@@ -696,6 +707,7 @@ class PalletRepository:
             return classification, first_seen, match_type, (str(expected["code"]) if expected is not None else None)
 
     def finish(self, pallet_id: int, collaborator: CollaboratorContext) -> None:
+        pending_error: PendingConferenceError | None = None
         with self.database.connection(immediate=True) as connection:
             pallet = connection.execute(
                 "SELECT conference_status, started_at FROM pallets WHERE id = ?", (pallet_id,)
@@ -724,36 +736,40 @@ class PalletRepository:
                         deduplicate=True,
                     )
             if missing:
-                raise PendingConferenceError(
-                    missing, 0, 0, 0,
+                pending_error = PendingConferenceError(missing, 0, 0, 0)
+            else:
+                now = self._now(connection)
+                duration = connection.execute(
+                    "SELECT MAX(0, CAST((julianday(?) - julianday(?)) * 86400 AS INTEGER)) AS seconds",
+                    (now, pallet["started_at"]),
+                ).fetchone()["seconds"]
+                productivity = (counts["confirmed"] * 3600 / duration) if duration else float(counts["confirmed"])
+                updated = connection.execute(
+                    """
+                    UPDATE pallets
+                    SET status = 'COMPLETED', conference_status = ?, finished_at = ?,
+                        duration_seconds = ?, productivity_boxes_per_hour = ?,
+                        finished_by_collaborator_id = ?,
+                        final_justification = NULL, status_sincronizacao = 'PENDENTE',
+                        sincronizacao_iniciada_em = NULL, sincronizado_em = NULL,
+                        recibo_sincronizacao = NULL, ultimo_erro_sincronizacao = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND conference_status = ?
+                    """,
+                    (ConferenceStatus.FINISHED, now, duration, productivity, collaborator.id, now, pallet_id, ConferenceStatus.OPEN),
                 )
-            now = self._now(connection)
-            duration = connection.execute(
-                "SELECT MAX(0, CAST((julianday(?) - julianday(?)) * 86400 AS INTEGER)) AS seconds",
-                (now, pallet["started_at"]),
-            ).fetchone()["seconds"]
-            productivity = (counts["confirmed"] * 3600 / duration) if duration else float(counts["confirmed"])
-            updated = connection.execute(
-                """
-                UPDATE pallets
-                SET status = 'COMPLETED', conference_status = ?, finished_at = ?,
-                    duration_seconds = ?, productivity_boxes_per_hour = ?,
-                    finished_by_collaborator_id = ?, sync_status = 'PENDING',
-                    final_justification = NULL, updated_at = ?
-                WHERE id = ? AND conference_status = ?
-                """,
-                (ConferenceStatus.FINISHED, now, duration, productivity, collaborator.id, now, pallet_id, ConferenceStatus.OPEN),
-            )
-            if updated.rowcount != 1:
-                raise RepositoryStateError("CHANGED")
-            connection.execute(
-                """
-                UPDATE conference_attempts SET status = 'COMPLETED', finished_at = ?,
-                    finished_by_collaborator_id = ?
-                WHERE id = ? AND status = 'IN_PROGRESS'
-                """,
-                (now, collaborator.id, attempt["id"]),
-            )
+                if updated.rowcount != 1:
+                    raise RepositoryStateError("CHANGED")
+                connection.execute(
+                    """
+                    UPDATE conference_attempts SET status = 'COMPLETED', finished_at = ?,
+                        finished_by_collaborator_id = ?
+                    WHERE id = ? AND status = 'IN_PROGRESS'
+                    """,
+                    (now, collaborator.id, attempt["id"]),
+                )
+        if pending_error is not None:
+            raise pending_error
 
     @staticmethod
     def _record_divergence(
@@ -761,37 +777,14 @@ class PalletRepository:
         divergence_type: str, code: str, description: str,
         collaborator: CollaboratorContext, *, deduplicate: bool = False,
     ) -> None:
-        if deduplicate and connection.execute(
-            """SELECT 1 FROM conference_divergences
-               WHERE pallet_id = ? AND divergence_type = ? AND carton_code = ? AND status = 'PENDENTE'""",
-            (pallet_id, divergence_type, code),
-        ).fetchone() is not None:
-            return
-        connection.execute(
-            """INSERT INTO conference_divergences(
-                pallet_id, attempt_id, divergence_type, carton_code, description,
-                found_at, found_by_collaborator_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (pallet_id, attempt_id, divergence_type, code, description,
-             PalletRepository._now(connection), collaborator.id),
+        DivergenceRepository().record(
+            connection, pallet_id, attempt_id, divergence_type, code, description,
+            collaborator, PalletRepository._now(connection), deduplicate=deduplicate,
         )
 
     @staticmethod
     def _divergence_counts(connection: sqlite3.Connection, pallet_id: int) -> dict:
-        by_type = {key: 0 for key in ("FALTA", "SOBRA", "DUPLICIDADE", "CAIXA_NAO_ESPERADA", "INCONSISTENCIA")}
-        total = pending = resolved = 0
-        for row in connection.execute(
-            """SELECT divergence_type, status, COUNT(*) AS total
-               FROM conference_divergences WHERE pallet_id = ?
-               GROUP BY divergence_type, status""", (pallet_id,)
-        ):
-            total += row["total"]
-            if row["status"] == "PENDENTE":
-                pending += row["total"]
-                by_type[row["divergence_type"]] += row["total"]
-            else:
-                resolved += row["total"]
-        return {"total": total, "pending": pending, "resolved": resolved, "by_type": by_type}
+        return DivergenceRepository().counts(connection, pallet_id)
 
     @staticmethod
     def _active_for_collaborator(
@@ -811,56 +804,11 @@ class PalletRepository:
             (collaborator_id,),
         ).fetchone()
 
-    def record_sync_not_configured(
-        self,
-        pallet_id: int,
-        collaborator: CollaboratorContext,
-        message: str,
-    ) -> None:
-        with self.database.connection(immediate=True) as connection:
-            pallet = connection.execute(
-                "SELECT conference_status FROM pallets WHERE id = ?", (pallet_id,)
-            ).fetchone()
-            if pallet is None:
-                raise RepositoryStateError("NOT_FOUND")
-            if pallet["conference_status"] == ConferenceStatus.CANCELLED:
-                raise RepositoryStateError("CANCELLED")
-            if pallet["conference_status"] != ConferenceStatus.FINISHED:
-                raise RepositoryStateError("NOT_FINISHED")
-            now = self._now(connection)
-            connection.execute(
-                """
-                INSERT INTO synchronization_attempts(
-                    pallet_id, collaborator_id, status, message,
-                    started_at, finished_at
-                )
-                VALUES (?, ?, 'NOT_CONFIGURED', ?, ?, ?)
-                """,
-                (pallet_id, collaborator.id, message, now, now),
-            )
-            connection.execute(
-                """
-                UPDATE pallets
-                SET sync_status = 'NOT_CONFIGURED', updated_at = ?
-                WHERE id = ?
-                """,
-                (now, pallet_id),
-            )
-
     @staticmethod
     def _latest_attempt(
         connection: sqlite3.Connection, pallet_id: int
     ) -> sqlite3.Row | None:
-        return connection.execute(
-            """
-            SELECT *
-            FROM conference_attempts
-            WHERE pallet_id = ?
-            ORDER BY attempt_number DESC
-            LIMIT 1
-            """,
-            (pallet_id,),
-        ).fetchone()
+        return ConferenceAttemptRepository().latest(connection, pallet_id)
 
     @staticmethod
     def _counts(
@@ -903,15 +851,29 @@ class PalletRepository:
 
     @staticmethod
     def _format_local_datetime(value: object) -> str | None:
-        if not isinstance(value, str) or not value:
+        """Format persisted UTC timestamps for the Brazilian operational UI.
+
+        SQLite stores the application timestamps as ISO-8601 UTC strings with
+        ``Z`` (see migration 008 and ``_now``).  Naive values therefore follow
+        that same UTC persistence contract before a single conversion to São
+        Paulo.  Aware datetimes retain their own offset and are never shifted
+        twice.
+        """
+        if value is None or value == "":
             return None
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                iso_value = value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value
+                parsed = datetime.fromisoformat(iso_value)
+            except ValueError:
+                return None
+        else:
             return None
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(ZoneInfo("America/Sao_Paulo")).strftime(
+        return parsed.astimezone(SAO_PAULO_TIMEZONE).strftime(
             "%d/%m/%Y %H:%M:%S"
         )
 
@@ -922,6 +884,11 @@ class PalletRepository:
             "FINALIZADA": "CONFERÊNCIA FINALIZADA",
             "CANCELADA": "CANCELADA",
         }.get(status, status)
+
+    @staticmethod
+    def _pallet_class(cartons: list[sqlite3.Row]) -> str:
+        classes = {normalize_caixa_estoque(row["ds_classe"]).upper() for row in cartons if normalize_caixa_estoque(row["ds_classe"])}
+        return next(iter(classes)) if len(classes) == 1 else "MISTO" if classes else "NÃO INFORMADO"
 
     @staticmethod
     def _summary(

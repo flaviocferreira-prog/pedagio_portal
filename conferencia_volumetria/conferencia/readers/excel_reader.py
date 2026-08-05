@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import re
-from collections import defaultdict
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -22,8 +21,12 @@ class PalletFileImporter:
     ACCEPTED_COLUMNS = frozenset({
         "CAIXA_ESTOQUE", "CAIXA_ESTOQUE VARCHAR2", "CAIXA ESTOQUE",
     })
+    CLASS_COLUMNS = frozenset({"DS_CLASSE", "DS CLASSE", "DS_CLASSE VARCHAR2"})
 
     def read_carton_codes(self, file_path: Path, extension: str) -> list[str]:
+        return [item["caixa_estoque"] for item in self.read_expected_items(file_path, extension)]
+
+    def read_expected_items(self, file_path: Path, extension: str) -> list[dict[str, str]]:
         rows = self._rows(file_path, extension)
         try:
             try:
@@ -31,25 +34,18 @@ class PalletFileImporter:
             except StopIteration as error:
                 raise ExcelReadError("O arquivo nao possui cabecalho.") from error
             index = self._required_column_index(header)
-            codes: list[str] = []
-            lines: dict[str, list[int]] = defaultdict(list)
+            class_index = self._optional_column_index(header, self.CLASS_COLUMNS)
+            items: list[dict[str, str]] = []
             for line_number, row in enumerate(rows, start=2):
                 if index >= len(row):
                     continue
                 code = self._cell_value(row[index], line_number)
                 if code:
-                    codes.append(code)
-                    lines[code].append(line_number)
-            if not codes:
+                    classe = self._class_value(row[class_index]) if class_index is not None and class_index < len(row) else ""
+                    items.append({"caixa_estoque": code, "ds_classe": classe})
+            if not items:
                 raise ExcelReadError("Nao ha caixas validas na coluna CAIXA_ESTOQUE.")
-            duplicated = [(code, positions) for code, positions in lines.items() if len(positions) > 1]
-            if duplicated:
-                details = "; ".join(
-                    f"{code} (linhas {', '.join(map(str, positions))})"
-                    for code, positions in duplicated[:10]
-                )
-                raise ExcelReadError(f"Existem caixas realmente duplicadas no arquivo: {details}.")
-            return codes
+            return items
         finally:
             close = getattr(rows, "close", None)
             if close is not None:
@@ -101,6 +97,13 @@ class PalletFileImporter:
             "A coluna obrigat\u00f3ria CAIXA_ESTOQUE n\u00e3o foi encontrada. "
             f"Cabe\u00e7alhos recebidos: {received!r}"
         )
+
+    def _optional_column_index(self, header: list[object], accepted: frozenset[str]) -> int | None:
+        return next((index for index, cell in enumerate(header) if self._normalize_header(self._raw_value(cell)) in accepted), None)
+
+    @staticmethod
+    def _class_value(cell: object) -> str:
+        return normalize_caixa_estoque(cell.value if hasattr(cell, "value") else cell).upper()
 
     @staticmethod
     def _normalize_header(value: str) -> str:

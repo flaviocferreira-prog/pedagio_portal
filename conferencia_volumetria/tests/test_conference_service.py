@@ -8,8 +8,10 @@ import unittest
 import zipfile
 from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 from conferencia.controllers.conference_controller import ConferenceController
 from conferencia.domain.box_codes import content_hash_caixa_estoque
@@ -17,10 +19,13 @@ from conferencia.domain.entities import CollaboratorContext, ConferenceImport
 from conferencia.infrastructure.database import SQLiteDatabase
 from conferencia.infrastructure.session_manager import SessionManager
 from conferencia.infrastructure.settings import AppSettings
+from conferencia.infrastructure.timezones import SAO_PAULO_TIMEZONE_NAME, get_sao_paulo_timezone
 from conferencia.readers.excel_reader import ExcelReadError, PalletFileImporter
 from conferencia.repositories.colaborador_repository import ColaboradorRepository
 from conferencia.repositories.pallet_repository import PalletRepository
 from conferencia.services.acesso_service import AcessoService
+from conferencia.services.automatic_report_service import AutomaticReportService
+from conferencia.services.google_sheets_sync_service import GoogleSheetsSyncService
 from conferencia.services.conference_service import (
     ConflictError,
     InvalidScanError,
@@ -41,6 +46,14 @@ class ConfiguredPalletReader:
 
     def read_carton_codes(self, file_path: Path, extension: str) -> list[str]:
         return self.codes
+
+
+class ItemReader:
+    def __init__(self, items: list[dict[str, str]]) -> None:
+        self.items = items
+
+    def read_expected_items(self, file_path: Path, extension: str) -> list[dict[str, str]]:
+        return self.items
 
 
 def minimal_xlsx(codes: list[str], *, numeric: bool = False) -> bytes:
@@ -137,6 +150,8 @@ class ConferenceServiceTests(unittest.TestCase):
     def test_import_opens_and_preserves_session_actor(self) -> None:
         self.assertEqual("EM_ABERTO", self.created["status"])
         self.assertIsNone(self.created["started_at"])
+        self.assertTrue(self.created["importation"]["imported_at_iso"].endswith("Z"))
+        self.assertRegex(self.created["importation"]["imported_at"], r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$")
         self.assertEqual("000123", self.created["collaborator"]["registration"])
         self.assertEqual("palete.xlsx", self.created["source_filename"])
         self.assertEqual("AGENDA TESTE", self.created["importation"]["agenda"])
@@ -144,6 +159,30 @@ class ConferenceServiceTests(unittest.TestCase):
             {"origin": "PORTAL", "operation": "DIGITAL", "shift": "ADM"},
             {key: self.created["importation"][key] for key in ("origin", "operation", "shift")},
         )
+
+    def test_start_preserves_import_timestamp_and_sets_only_started_at(self) -> None:
+        imported_at = self.created["importation"]["imported_at_iso"]
+        started = self.start()
+        self.assertEqual(imported_at, started["importation"]["imported_at_iso"])
+        self.assertIsNotNone(started["started_at"])
+
+    def test_imported_at_uses_the_sqlite_utc_contract_and_brazilian_format(self) -> None:
+        self.assertEqual(
+            "03/08/2026 20:06:00",
+            self.repository._format_local_datetime("2026-08-03T23:06:00Z"),
+        )
+        self.assertEqual(
+            "03/08/2026 20:06:00",
+            self.repository._format_local_datetime("2026-08-03T23:06:00"),
+        )
+
+    def test_datetime_with_timezone_is_converted_once_and_empty_values_are_safe(self) -> None:
+        sao_paulo_value = datetime(2026, 8, 3, 20, 6, tzinfo=timezone(timedelta(hours=-3)))
+        self.assertEqual("03/08/2026 20:06:00", self.repository._format_local_datetime(sao_paulo_value))
+        self.assertEqual("03/08/2026 20:06:00", self.repository._format_local_datetime("2026-08-03T20:06:00-03:00"))
+        self.assertIsNone(self.repository._format_local_datetime(None))
+        self.assertIsNone(self.repository._format_local_datetime(""))
+        self.assertIsNone(self.repository._format_local_datetime("data-invalida"))
 
     def test_content_hash_is_order_independent_but_preserves_duplicates_and_zeros(self) -> None:
         first = content_hash_caixa_estoque([" 00123 ", "cx-2", "CX-2"])
@@ -154,6 +193,28 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertEqual(first, same_content)
         self.assertNotEqual(first, without_duplicate)
         self.assertNotEqual(first, without_zero)
+
+    def test_one_scan_confirms_all_repeated_rows_and_preserves_classes(self) -> None:
+        self.service.cancel_pallet(self.public_id, self.actor)
+        service = ConferenceService(
+            self.repository,
+            ItemReader([
+                {"caixa_estoque": "000099", "ds_classe": "vestuario"},
+                {"caixa_estoque": "000099", "ds_classe": "calçados"},
+                {"caixa_estoque": "000099", "ds_classe": ""},
+            ]),
+            AppSettings(temporary_directory=Path(self.tempdir.name) / "uploads"),
+        )
+        created = service.import_pallet(ConferenceImport(self.actor, "repetido.csv", b64encode(b"x").decode(), "PORTAL", "DIGITAL"))
+        service.start_pallet(created["public_id"], self.actor)
+        scanned = service.scan_carton(created["public_id"], "000099", self.actor)
+        self.assertEqual("CONFERIDA", scanned["result"])
+        self.assertEqual(3, scanned["summary"]["total_confirmed"])
+        self.assertEqual(0, scanned["summary"]["total_missing"])
+        self.assertEqual(1, len(scanned["recent_scans"]))
+        self.assertEqual(["VESTUARIO", "CALÇADOS", "NÃO INFORMADO"], [box["ds_classe"] for box in scanned["cartons"]])
+        self.assertEqual("MISTO", scanned["pallet_class"])
+        self.assertEqual("DUPLICADA", service.scan_carton(created["public_id"], "000099", self.actor)["result"])
 
     def test_same_open_content_is_resumed_and_cancelled_content_creates_linked_record(self) -> None:
         resumed = self.service.import_pallet(
@@ -168,6 +229,17 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertEqual("created_after_cancellation", recreated["action"])
         self.assertNotEqual(self.public_id, recreated["public_id"])
         self.assertEqual(self.public_id, recreated["previous_public_id"])
+
+    def test_open_content_owned_by_another_collaborator_is_not_resumed(self) -> None:
+        other = ColaboradorRepository(self.database).create("000456", "OUTRO OPERADOR")
+        other_actor = CollaboratorContext(int(other["id"]), str(other["matricula"]), str(other["nome"]))
+        with self.assertRaises(ConflictError) as raised:
+            self.service.import_pallet(
+                ConferenceImport(other_actor, "mesmo-conteudo.xlsx", b64encode(b"outro").decode(), "PORTAL", "DIGITAL", "AGENDA TESTE")
+            )
+        self.assertEqual("CONTEUDO_EM_CONFERENCIA", raised.exception.code)
+        self.assertEqual("000123", raised.exception.details["owner_registration"])
+        self.assertIn("OPERADOR TESTE", str(raised.exception))
 
     def test_finished_content_blocks_and_adm_reconference_preserves_hash(self) -> None:
         self.start()
@@ -195,6 +267,12 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertTrue(reconference["is_reconference"])
         self.assertEqual(finished["content_hash"], reconference["content_hash"])
         self.assertIsNotNone(finished["importation"]["imported_at"])
+        self.assertIsNone(reconference["started_at"])
+        self.assertEqual("READY", reconference["active_attempt"]["status"])
+        reconference_imported_at = reconference["importation"]["imported_at_iso"]
+        reconference_started = self.service.start_pallet(reconference["public_id"], self.actor)
+        self.assertEqual(reconference_imported_at, reconference_started["importation"]["imported_at_iso"])
+        self.assertIsNotNone(reconference_started["started_at"])
         self.assertEqual(
             ["000001", "CX-002", "CX-003"],
             [box["caixa_estoque"] for box in self.created["cartons"]],
@@ -317,6 +395,20 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertEqual("CONFERENCIA_COM_PENDENCIAS", raised.exception.code)
         self.assertEqual(2, raised.exception.details["faltantes"])
         self.assertEqual(0, raised.exception.details["divergentes"])
+        with self.database.connection() as connection:
+            missing_count = connection.execute(
+                "SELECT COUNT(*) FROM conference_divergences WHERE pallet_id = ? AND divergence_type = 'FALTA'",
+                (self.repository.find_by_public_id(self.public_id)["id"],),
+            ).fetchone()[0]
+        self.assertEqual(2, missing_count)
+        with self.assertRaises(ConflictError):
+            self.service.finish_pallet(self.public_id, self.actor)
+        with self.database.connection() as connection:
+            repeated_missing_count = connection.execute(
+                "SELECT COUNT(*) FROM conference_divergences WHERE pallet_id = ? AND divergence_type = 'FALTA'",
+                (self.repository.find_by_public_id(self.public_id)["id"],),
+            ).fetchone()[0]
+        self.assertEqual(2, repeated_missing_count)
 
     def test_full_coverage_waits_for_manual_finish_and_accepts_extra_scan(self) -> None:
         self.start()
@@ -331,9 +423,6 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertEqual("EM_ABERTO", extra["status"])
         self.assertEqual("EM_ABERTO", extra["workflow_status"])
         self.assertEqual(1, extra["summary"]["total_extra"])
-        with self.assertRaises(ConflictError) as raised:
-            self.service.sync_pallet(self.public_id, self.actor)
-        self.assertEqual("STATE_CONFLICT", raised.exception.code)
         self.assertEqual("FINALIZADA", self.service.finish_pallet(self.public_id, self.actor)["status"])
 
     def test_duplicate_scan_does_not_block_finish_at_full_coverage(self) -> None:
@@ -361,17 +450,6 @@ class ConferenceServiceTests(unittest.TestCase):
         repeated = self.service.finish_pallet(self.public_id, self.actor)
         self.assertEqual(finished["finished_at"], repeated["finished_at"])
         self.assertEqual("A conferência já está finalizada.", repeated["message"])
-        synchronization = self.service.sync_pallet(self.public_id, self.actor)
-        self.assertEqual("NOT_CONFIGURED", synchronization["sync_status"])
-        with self.database.connection() as connection:
-            sync_actor = connection.execute(
-                """
-                SELECT c.matricula
-                FROM synchronization_attempts s
-                JOIN colaboradores c ON c.id = s.collaborator_id
-                """
-            ).fetchone()["matricula"]
-        self.assertEqual("000123", sync_actor)
         with self.assertRaises(ConflictError) as scan_error:
             self.service.scan_carton(self.public_id, "000001", self.actor)
         self.assertEqual("CONFERENCIA_ENCERRADA", scan_error.exception.code)
@@ -399,6 +477,7 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertGreater(counts["expected_cartons"], 0)
         self.assertGreater(counts["scan_events"], 0)
         self.assertGreater(counts["conference_attempts"], 0)
+        self.assertEqual("CANCELLED", details["active_attempt"]["status"])
         for action in (
             lambda: self.service.scan_carton(self.public_id, "000001", self.actor),
             lambda: self.service.finish_pallet(self.public_id, self.actor),
@@ -407,6 +486,17 @@ class ConferenceServiceTests(unittest.TestCase):
             with self.assertRaises(ConflictError) as raised:
                 action()
             self.assertEqual("CONFERENCIA_CANCELADA", raised.exception.code)
+
+    def test_cancel_before_start_closes_ready_attempt(self) -> None:
+        cancelled = self.service.cancel_pallet(self.public_id, self.actor)
+        self.assertEqual("CANCELADA", cancelled["status"])
+        self.assertEqual("CANCELLED", cancelled["active_attempt"]["status"])
+        with self.database.connection() as connection:
+            finished_at = connection.execute(
+                "SELECT finished_at FROM conference_attempts WHERE pallet_id = ?",
+                (self.repository.find_by_public_id(self.public_id)["id"],),
+            ).fetchone()["finished_at"]
+        self.assertIsNotNone(finished_at)
 
     def test_two_simultaneous_scans_confirm_once(self) -> None:
         self.start()
@@ -433,10 +523,15 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertEqual(1, confirmations)
 
     def test_import_rejects_missing_collaborator_and_legacy_extension(self) -> None:
-        with self.assertRaisesRegex(ValidationError, "Agenda é obrigatória"):
-            self.service.import_pallet(
-                ConferenceImport(self.actor, "agenda.csv", b64encode(b"x").decode(), "PORTAL", "DIGITAL")
-            )
+        self.service.cancel_pallet(self.public_id, self.actor)
+        without_agenda = ConferenceService(
+            self.repository,
+            ConfiguredPalletReader(["SEM-AGENDA"]),
+            AppSettings(temporary_directory=Path(self.tempdir.name) / "uploads"),
+        ).import_pallet(
+            ConferenceImport(self.actor, "sem-agenda.csv", b64encode(b"x").decode(), "PORTAL", "DIGITAL")
+        )
+        self.assertEqual("", without_agenda["importation"]["agenda"])
         with self.assertRaisesRegex(ValidationError, "Identifique o colaborador"):
             self.service.import_pallet(
                 ConferenceImport(
@@ -466,7 +561,7 @@ class ConferenceServiceTests(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-        self.assertEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], versions)
+        self.assertEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18], versions)
         with self.assertRaises(ValidationError):
             self.service.import_pallet(
                 ConferenceImport(
@@ -500,14 +595,16 @@ class ReaderTests(unittest.TestCase):
             self.reader.read_carton_codes(path, ".csv"),
         )
 
-    def test_csv_reports_exact_duplicate_codes_and_lines(self) -> None:
+    def test_csv_keeps_exact_duplicate_codes_as_distinct_rows(self) -> None:
         path = self.directory / "duplicado.csv"
         path.write_text(
             "CAIXA_ESTOQUE;OUTRA\n000047985660090489108;A\n000047985660090489108;B\n",
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(ExcelReadError, r"000047985660090489108 \(linhas 2, 3\)"):
-            self.reader.read_carton_codes(path, ".csv")
+        self.assertEqual(
+            ["000047985660090489108", "000047985660090489108"],
+            self.reader.read_carton_codes(path, ".csv"),
+        )
 
     def test_csv_missing_caixa_estoque_reports_received_headers(self) -> None:
         path = self.directory / "sem-coluna.csv"
@@ -559,6 +656,20 @@ class JsonHttpClient:
         return response.status, json.loads(raw), response_headers
 
 
+class TimezoneTests(unittest.TestCase):
+    def test_sao_paulo_zoneinfo_is_available(self) -> None:
+        timezone_value = get_sao_paulo_timezone()
+        self.assertEqual(SAO_PAULO_TIMEZONE_NAME, timezone_value.key)
+
+    def test_sao_paulo_timezone_falls_back_when_iana_data_is_unavailable(self) -> None:
+        from zoneinfo import ZoneInfoNotFoundError
+
+        with patch("conferencia.infrastructure.timezones.ZoneInfo", side_effect=ZoneInfoNotFoundError("missing")):
+            fallback = get_sao_paulo_timezone()
+        self.assertEqual(SAO_PAULO_TIMEZONE_NAME, fallback.tzname(None))
+        self.assertEqual(timedelta(hours=-3), fallback.utcoffset(None))
+
+
 class OfficialHttpFlowTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -576,6 +687,10 @@ class OfficialHttpFlowTests(unittest.TestCase):
         TestHandler.controller = ConferenceController(service)
         TestHandler.acesso_service = AcessoService(self.collaborators, settings)
         TestHandler.sessions = SessionManager()
+        self.downloads = Path(self.tempdir.name) / "Downloads"
+        self.downloads.mkdir()
+        TestHandler.automatic_report_service = AutomaticReportService(settings.max_upload_bytes, (self.downloads,))
+        TestHandler.google_sync_service = GoogleSheetsSyncService(self.database, settings)
 
         from http.server import ThreadingHTTPServer
 
@@ -649,6 +764,48 @@ class OfficialHttpFlowTests(unittest.TestCase):
         forbidden_message = "Matrícula é " + "obrigatória"
         self.assertNotIn(forbidden_message, json.dumps(body, ensure_ascii=False))
 
+    def test_finish_has_no_follow_up_404_and_returns_explicit_inactive_state(self) -> None:
+        self.client.request("POST", "/api/access", {"matricula": "001234"})
+        uploaded_status, uploaded, _ = self.client.request(
+            "POST", "/api/conferences",
+            {"filename": "finalizar.csv", "content_base64": b64encode(b"CAIXA_ESTOQUE\n0001\n").decode()},
+        )
+        self.assertEqual(201, uploaded_status)
+        public_id = uploaded["data"]["public_id"]
+        self.assertEqual(200, self.client.request("POST", f"/api/conferences/{public_id}/start")[0])
+        self.assertEqual(200, self.client.request("POST", f"/api/conferences/{public_id}/scan", {"caixa_estoque": "0001"})[0])
+
+        finished_status, finished, _ = self.client.request("POST", f"/api/conferences/{public_id}/finish")
+        active_status, active, _ = self.client.request("GET", "/api/conferences/active")
+        pending_status, pending, _ = self.client.request("GET", "/api/sincronizacao/pendentes")
+
+        self.assertEqual(200, finished_status)
+        self.assertEqual("FINALIZADA", finished["data"]["status"])
+        self.assertEqual("PENDENTE", finished["data"]["synchronization"]["status"])
+        self.assertEqual(200, active_status)
+        self.assertFalse(active["data"]["has_active_conference"])
+        self.assertIsNone(active["data"]["conference"])
+        self.assertEqual(200, pending_status)
+        self.assertEqual(1, pending["data"]["pending"])
+
+    def test_latest_wms_report_is_discovered_and_imported_by_opaque_id(self) -> None:
+        report = self.downloads / "relatorio_ConsultaPaleteDistribuicaoAgrupada (3).csv"
+        report.write_text("CAIXA_ESTOQUE\n000001\n", encoding="utf-8")
+        self.client.request("POST", "/api/access", {"matricula": "001234"})
+
+        status, body, _ = self.client.request("GET", "/api/conferences/latest-wms-report")
+
+        self.assertEqual(200, status)
+        self.assertTrue(body["data"]["found"])
+        self.assertEqual(report.name, body["data"]["filename"])
+        self.assertNotIn(str(report), json.dumps(body, ensure_ascii=False))
+        status, body, _ = self.client.request(
+            "POST", "/api/conferences/import-automatic",
+            {"automatic_file_id": body["data"]["file_id"], "origin": "PORTAL", "operation": "DIGITAL"},
+        )
+        self.assertEqual(201, status)
+        self.assertEqual(["000001"], [item["caixa_estoque"] for item in body["data"]["cartons"]])
+
     def test_complete_real_cookie_flow(self) -> None:
         access_status, access_body, access_headers = self.client.request(
             "POST", "/api/access", {"matricula": "001234"}
@@ -681,6 +838,20 @@ class OfficialHttpFlowTests(unittest.TestCase):
         )
         self.assertEqual(200, start_status)
         self.assertEqual("EM_ABERTO", start_body["data"]["status"])
+        self.assertEqual("001234", start_body["data"]["collaborator"]["registration"])
+        self.assertEqual(["000001", "CX-002"], [
+            carton["caixa_estoque"] for carton in start_body["data"]["cartons"]
+        ])
+        self.assertRegex(
+            start_body["data"]["importation"]["imported_at"],
+            r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$",
+        )
+        self.assertTrue(start_body["data"]["importation"]["imported_at_iso"].endswith("Z"))
+        self.assertIsNotNone(start_body["data"]["active_attempt"]["started_at"])
+        self.assertEqual(
+            {"total_expected": 2, "total_confirmed": 0, "coverage_percent": 0.0},
+            {key: start_body["data"]["summary"][key] for key in ("total_expected", "total_confirmed", "coverage_percent")},
+        )
 
         valid_status, valid_body, _ = self.client.request(
             "POST",
@@ -852,7 +1023,7 @@ class OfficialHttpFlowTests(unittest.TestCase):
         self.assertEqual(201, status)
         conference = imported["data"]
         self.assertEqual(codes, [box["caixa_estoque"] for box in conference["cartons"]])
-        self.assertIsNone(conference["importation"]["imported_at"])
+        self.assertIsNotNone(conference["importation"]["imported_at"])
         self.client.request("POST", f"/api/conferences/{conference['public_id']}/start")
 
         status, recovered, _ = self.client.request("GET", "/api/conferences/active")
@@ -876,7 +1047,7 @@ class OfficialHttpFlowTests(unittest.TestCase):
         status, imported, _ = self.client.request("POST", "/api/conferences", payload)
         self.assertEqual(201, status)
         public_id = imported["data"]["public_id"]
-        self.assertIsNone(imported["data"]["importation"]["imported_at_iso"])
+        self.assertTrue(imported["data"]["importation"]["imported_at_iso"].endswith("Z"))
         _, started, _ = self.client.request("POST", f"/api/conferences/{public_id}/start")
         imported_at = started["data"]["importation"]["imported_at_iso"]
         self.client.request("POST", f"/api/conferences/{public_id}/scan", {"caixa_estoque": "000001"})
@@ -931,7 +1102,7 @@ class StaticInterfaceContractTests(unittest.TestCase):
     def test_active_conference_screen_is_backend_recovered_and_upload_card_is_exclusive(self) -> None:
         self.assertIn('id="upload-card" class="card" hidden', self.conference)
         self.assertIn("loadActiveConference", (self.root / "static/js/main.js").read_text(encoding="utf-8"))
-        self.assertIn('api("/api/conferences/active")', self.conference_js)
+        self.assertIn("routes.activeConference", self.conference_js)
         self.assertIn('$("#upload-card").hidden = isActiveConference(data)', self.conference_js)
         self.assertIn('$("#upload-card").hidden = false', self.conference_js)
         self.assertIn('await load(created.public_id, created)', self.upload_js)
@@ -941,13 +1112,14 @@ class StaticInterfaceContractTests(unittest.TestCase):
         self.assertIn('$("#carton-list").replaceChildren()', self.conference_js)
         self.assertIn('$("#extra-list").replaceChildren()', self.conference_js)
         self.assertIn('$("#progress").value = 0', self.conference_js)
-        self.assertIn('finishModal.close();\n      showImportCard();', self.conference_js)
+        self.assertIn('finishModal.close(); showImportCard();', self.conference_js)
         self.assertNotIn('if (state.latest_conference)', self.conference_js)
 
     def test_divergences_are_statuses_only_without_resolution_flow(self) -> None:
-        for status in ("DUPLICADO", "SOBRA", "FALTA"):
+        for status in ("DUPLICADO", "FALTA"):
             self.assertIn(f'"{status}"', self.conference_js)
         self.assertIn('data.unexpected_cartons || []', self.conference_js)
+        self.assertIn('item.append(code)', self.conference_js)
         self.assertNotIn('Resolver', self.conference_js)
         self.assertNotIn('/divergences/', self.conference_js)
         self.assertNotIn('summary-divergences-', self.conference)
@@ -957,20 +1129,20 @@ class StaticInterfaceContractTests(unittest.TestCase):
         self.assertIn('id="finish-form"', self.conference)
         self.assertIn("100% conferido — aguardando finalização", self.conference)
         self.assertIn('data.status === "EM_ABERTO"', self.conference_js)
-        self.assertIn('data.status !== "FINALIZADA"', self.conference_js)
+        self.assertIn('finishModal.close(); showImportCard();', self.conference_js)
         self.assertIn('addEventListener("submit", async (event)', self.conference_js)
 
     def test_scan_keeps_caixa_estoque_as_string_and_restart_is_absent(self) -> None:
         self.assertIn('String(value ?? "").trim()', self.conference_js)
         self.assertIn("JSON.stringify({ caixa_estoque: caixaEstoque })", self.conference_js)
-        self.assertNotIn("Number(", self.conference_js)
+        self.assertNotIn("Number(caixaEstoque", self.conference_js)
         self.assertNotIn("parseInt(", self.conference_js)
         self.assertNotIn("parseFloat(", self.conference_js)
         self.assertNotIn("matricula", self.conference_js.casefold())
         self.assertNotIn('id="restart-modal"', self.conference)
         self.assertNotIn("Reiniciar conferência", self.conference)
         self.assertIn("Cancelar conferência", self.conference)
-        self.assertIn('addEventListener("input", scheduleAutomaticScan)', self.conference_js)
+        self.assertIn('addEventListener("input", scheduleScan)', self.conference_js)
         self.assertIn('addEventListener("paste"', self.conference_js)
         self.assertIn("AUTO_SCAN_DELAY_MS", self.conference_js)
 

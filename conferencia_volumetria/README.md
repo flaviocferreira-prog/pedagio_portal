@@ -48,4 +48,5 @@ py -m unittest discover -s tests -v
 | `POST` | `/api/conferences/{public_id}/scan` | Registra uma bipagem |
 | `POST` | `/api/conferences/{public_id}/finish` | Finaliza sem pendências |
 | `POST` | `/api/conferences/{public_id}/cancel` | Cancela e preserva o histórico |
-| `POST` | `/api/conferences/{public_id}/sync` | Registra tentativa de sincronização |
+| `POST` | `/sincronizacao/{public_id}/preparar/` | Prepara tentativa assinada e abre o popup Google |
+| `GET` | `/sincronizacao/confirmar/` | Recebe o resultado assinado do popup e confirma no SQLite |

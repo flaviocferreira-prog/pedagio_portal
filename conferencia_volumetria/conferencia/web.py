@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import re
+from html import escape
 from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from conferencia.controllers.conference_controller import ConferenceController
 from conferencia.domain.entities import CollaboratorContext
@@ -29,6 +31,8 @@ from conferencia.services.conference_service import (
     PayloadTooLargeError,
     ValidationError,
 )
+from conferencia.services.google_sheets_sync_service import GoogleSheetsSyncService
+from conferencia.services.automatic_report_service import AutomaticReportService
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_ROOT = PROJECT_ROOT / "static"
@@ -43,15 +47,26 @@ class ApplicationHandler(BaseHTTPRequestHandler):
     acesso_service: AcessoService
     sessions: SessionManager
     max_json_bytes = 15 * 1024 * 1024
+    google_sync_service: GoogleSheetsSyncService | None = None
+    automatic_report_service: AutomaticReportService | None = None
 
     def do_GET(self) -> None:
-        path = unquote(urlparse(self.path).path)
+        parsed_url = urlparse(self.path)
+        path = unquote(parsed_url.path)
         if path == "/":
             return self._serve_file(PROJECT_ROOT / "access.html")
         if path == "/conference":
             if self._session() is None:
                 return self._redirect("/")
             return self._serve_file(PROJECT_ROOT / "index.html")
+        if path.rstrip("/") == "/sincronizacao/confirmar":
+            return self._confirm_google_sync(parse_qs(parsed_url.query))
+        if path == "/api/sincronizacao/pendentes":
+            if self._session() is None:
+                return self._collaborator_not_identified()
+            if self.google_sync_service is None:
+                return self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "SINCRONIZACAO_NAO_CONFIGURADA", "A sincronização não está configurada.")
+            return self._handle(self.google_sync_service.pending_summary)
         if path.startswith("/api/colaboradores/"):
             registration = path.removeprefix("/api/colaboradores/").strip("/")
             if not registration or "/" in registration:
@@ -66,6 +81,10 @@ class ApplicationHandler(BaseHTTPRequestHandler):
                         self._collaborator(self._session())
                     )
                 )
+            if path == "/api/conferences/latest-wms-report":
+                if self.automatic_report_service is None:
+                    return self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AUTOMATIC_REPORT_UNAVAILABLE", "A busca automática não está configurada.")
+                return self._handle(self.automatic_report_service.latest)
             route = self._conference_route(path)
             if route is None:
                 return self._not_found()
@@ -100,6 +119,16 @@ class ApplicationHandler(BaseHTTPRequestHandler):
             return self._update_collaborator(path)
         if path == "/api/logout":
             return self._logout()
+        if path.startswith("/sincronizacao/"):
+            if path.rstrip("/") == "/sincronizacao/pendentes/preparar":
+                return self._prepare_pending_google_sync()
+            if path.rstrip("/").endswith("/preparar"):
+                return self._prepare_google_sync(path)
+            if path.rstrip("/").endswith("/confirmar"):
+                return self._confirm_google_sync_json(path)
+            if path.rstrip("/").endswith("/erro"):
+                return self._mark_google_sync_error(path)
+            return self._not_found()
         if path != "/api/conferences" and not path.startswith("/api/conferences/"):
             return self._not_found()
         session = self._session()
@@ -123,6 +152,13 @@ class ApplicationHandler(BaseHTTPRequestHandler):
                 lambda: self.controller.import_pallet(payload, collaborator),
                 HTTPStatus.CREATED,
             )
+        if path == "/api/conferences/import-automatic":
+            if self.automatic_report_service is None:
+                return self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AUTOMATIC_REPORT_UNAVAILABLE", "A busca automática não está configurada.")
+            return self._handle(
+                lambda: self.controller.import_automatic_pallet(payload, collaborator, self.automatic_report_service),
+                HTTPStatus.CREATED,
+            )
         route = self._conference_route(path)
         if route is None:
             return self._not_found()
@@ -138,13 +174,235 @@ class ApplicationHandler(BaseHTTPRequestHandler):
             "reconference": lambda: self.controller.authorize_reconference(
                 public_id, payload, collaborator
             ),
-            "sync": lambda: self.controller.sync_pallet(public_id, collaborator),
             "cancel": lambda: self.controller.cancel_pallet(public_id, collaborator),
         }
         operation = operations.get(action or "")
         if operation is None:
             return self._not_found()
         return self._handle(operation)
+
+    def _prepare_pending_google_sync(self) -> None:
+        session = self._session()
+        if session is None:
+            return self._collaborator_not_identified()
+        if self.google_sync_service is None:
+            return self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "SINCRONIZACAO_NAO_CONFIGURADA", "A sincronização não está configurada.")
+        return_url = f"{self._request_origin()}/sincronizacao/confirmar/"
+        return self._handle(
+            lambda: self.google_sync_service.prepare_next_pending(
+                self._collaborator(session), return_url
+            )
+        )
+
+    def _prepare_google_sync(self, path: str) -> None:
+        session = self._session()
+        if session is None:
+            return self._collaborator_not_identified()
+        parts = [part for part in path.split("/") if part]
+        if len(parts) != 3 or parts[0] != "sincronizacao" or parts[2] != "preparar":
+            return self._not_found()
+        if self.google_sync_service is None:
+            return self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "SINCRONIZACAO_NAO_CONFIGURADA", "A sincronização não está configurada.")
+        public_id = parts[1]
+        return_url = f"{self._request_origin()}/sincronizacao/confirmar/"
+        return self._handle(
+            lambda: self.google_sync_service.prepare(
+                public_id, self._collaborator(session), return_url
+            )
+        )
+
+    def _confirm_google_sync_json(self, path: str) -> None:
+        session = self._session()
+        if session is None:
+            return self._collaborator_not_identified()
+        public_id = self._sync_public_id(path, "confirmar")
+        if public_id is None:
+            return self._not_found()
+        if self.google_sync_service is None:
+            return self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "SINCRONIZACAO_NAO_CONFIGURADA", "A sincronização não está configurada.")
+        payload = self._sync_json_body()
+        if payload is None:
+            return
+
+        def confirm() -> dict[str, object]:
+            receipt_public_id = str(payload.get("conference_id") or "")
+            if receipt_public_id != public_id:
+                self.google_sync_service.fail(
+                    public_id,
+                    "GOOGLE_RECEIPT_INVALID",
+                    str(payload.get("attempt_id") or ""), str(payload.get("nonce") or ""),
+                    self._collaborator(session),
+                )
+                raise ValidationError(
+                    "O recibo não pertence à conferência atual.",
+                    code="RECIBO_DE_OUTRA_CONFERENCIA",
+                )
+            try:
+                result = self.google_sync_service.confirm(
+                    public_id,
+                    str(payload.get("status") or ""),
+                    str(payload.get("sincronizado_em") or ""),
+                    str(payload.get("assinatura_recibo") or ""),
+                    str(payload.get("attempt_id") or ""), str(payload.get("nonce") or ""),
+                    bool(payload.get("ja_sincronizado")),
+                    self._collaborator(session),
+                )
+            except (ValidationError, ConflictError):
+                self.google_sync_service.fail(
+                    public_id,
+                    "GOOGLE_RECEIPT_INVALID",
+                    str(payload.get("attempt_id") or ""), str(payload.get("nonce") or ""),
+                    self._collaborator(session),
+                )
+                raise
+            return {**result, "status": "SINCRONIZADO"}
+
+        return self._handle(confirm)
+
+    def _mark_google_sync_error(self, path: str) -> None:
+        session = self._session()
+        if session is None:
+            return self._collaborator_not_identified()
+        public_id = self._sync_public_id(path, "erro")
+        if public_id is None:
+            return self._not_found()
+        if self.google_sync_service is None:
+            return self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "SINCRONIZACAO_NAO_CONFIGURADA", "A sincronização não está configurada.")
+        payload = self._sync_json_body()
+        if payload is None:
+            return
+        return self._handle(
+            lambda: self.google_sync_service.fail(
+                public_id,
+                str(payload.get("code") or ""),
+                str(payload.get("attempt_id") or ""), str(payload.get("nonce") or ""),
+                self._collaborator(session),
+            )
+        )
+
+    def _sync_json_body(self) -> dict[str, object] | None:
+        try:
+            return self._json_body()
+        except PayloadTooLargeError as error:
+            self._json_application_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, error)
+        except InvalidJsonError as error:
+            self._json_error(HTTPStatus.BAD_REQUEST, "INVALID_JSON", str(error))
+        return None
+
+    @staticmethod
+    def _sync_public_id(path: str, expected_action: str) -> str | None:
+        parts = [part for part in path.split("/") if part]
+        if len(parts) != 3 or parts[0] != "sincronizacao" or parts[2] != expected_action:
+            return None
+        return parts[1] or None
+
+    def _confirm_google_sync(self, query: dict[str, list[str]]) -> None:
+        session = self._session()
+        if session is None:
+            return self._collaborator_not_identified()
+        if self.google_sync_service is None:
+            return self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "SINCRONIZACAO_NAO_CONFIGURADA", "A sincronização não está configurada.")
+        value = lambda name: query.get(name, [""])[0]
+        try:
+            nonce = value("nonce")
+            attempt_id = value("attempt_id")
+            conference_id = value("conference_id")
+            status = value("status")
+            error_code = value("error_code")
+            if re.fullmatch(r"[A-Za-z0-9_-]{20,200}", nonce) is None:
+                raise ValidationError(
+                    "A identificação da tentativa de sincronização é inválida.",
+                    code="RECIBO_INVALIDO",
+                )
+            if status == "ERROR":
+                result = self.google_sync_service.fail(
+                    conference_id, error_code or "GOOGLE_SYNC_FAILED", attempt_id, nonce,
+                    self._collaborator(session),
+                )
+                return self._write_html(
+                    HTTPStatus.OK,
+                    self._sync_result_html(conference_id, attempt_id, nonce, "ERROR", result["message"], error_code),
+                )
+            if status not in ("SUCCESS", "ALREADY_SYNCED"):
+                raise ValidationError("O status do resultado é inválido.", code="RECIBO_INVALIDO")
+            result = self.google_sync_service.confirm(
+                conference_id, "SINCRONIZADO", value("sincronizado_em"),
+                value("assinatura_recibo"), attempt_id, nonce,
+                status == "ALREADY_SYNCED" or value("ja_sincronizado") == "true", self._collaborator(session),
+            )
+            already_synced = status == "ALREADY_SYNCED" or value("ja_sincronizado") == "true"
+            self._write_html(
+                HTTPStatus.OK,
+                self._sync_result_html(
+                    str(result["public_id"]), attempt_id, nonce,
+                    "ALREADY_SYNCED" if already_synced else "SUCCESS",
+                    "A conferência já estava sincronizada no Google Sheets." if already_synced
+                    else "Sincronização concluída com sucesso.",
+                    "", str(result["synchronized_at"]),
+                ),
+            )
+        except NotFoundError as error:
+            self._write_error_html(HTTPStatus.NOT_FOUND, str(error))
+        except (ValidationError, ConflictError) as error:
+            self._write_error_html(HTTPStatus.UNPROCESSABLE_ENTITY, str(error))
+
+    @staticmethod
+    def _sync_result_html(
+        public_id: str, attempt_id: str, nonce: str, status: str, message: str,
+        error_code: str = "", synchronized_at: str = "",
+    ) -> str:
+        result = json.dumps(
+            {
+                "source": "google-sheets-sync",
+                "type": "GOOGLE_SYNC_RESULT",
+                "conference_id": public_id,
+                "attempt_id": attempt_id,
+                "status": status,
+                "error_code": error_code,
+                "message": message,
+                "sincronizado_em": synchronized_at,
+                "nonce": nonce,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).replace("<", "\\u003c")
+        return f"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Resultado da sincronização</title></head><body>
+<main><h1>Resultado da sincronização</h1><p>Esta janela será fechada automaticamente.</p>
+<p id="close-warning" hidden>A sincronização foi concluída. Você já pode fechar esta janela.</p></main>
+<script>(function(){{"use strict";
+const resultado={result};
+function notifyAndClose(){{
+  const targetOrigin=window.location.origin;
+  if(window.opener&&!window.opener.closed){{window.opener.postMessage(resultado,targetOrigin);}}
+  setTimeout(function(){{
+    if(window.opener&&!window.opener.closed){{window.opener.postMessage(resultado,targetOrigin);}}
+  }},120);
+  setTimeout(function(){{window.close();}},550);
+}}
+notifyAndClose();
+}})();</script></body></html>"""
+
+    def _request_origin(self) -> str:
+        host = self.headers.get("Host", "127.0.0.1:8080")
+        if not host or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:[]" for character in host):
+            host = "127.0.0.1:8080"
+        forwarded_proto = self.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+        protocol = forwarded_proto if forwarded_proto in ("http", "https") else "http"
+        return f"{protocol}://{host}"
+
+    def _write_error_html(self, status: HTTPStatus, message: str) -> None:
+        self._write_html(status, f"<!doctype html><meta charset='utf-8'><h1>Não foi possível sincronizar</h1><p>{escape(message)}</p><a href='/conference'>Voltar ao sistema</a>")
+
+    def _write_html(self, status: HTTPStatus, html: str) -> None:
+        content = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(content)
 
     def _handle(
         self,
@@ -397,6 +655,7 @@ class ApplicationHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(content)
 

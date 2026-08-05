@@ -46,10 +46,9 @@ class PalletFileImporterTests(unittest.TestCase):
         source = self._xlsx("text.xlsx", [code], "  CAIXA_ESTOQUE   VARCHAR2 ")
         self.assertEqual([code], self.importer.read_carton_codes(source, ".xlsx"))
 
-    def test_real_duplicates_show_exact_code_and_original_lines(self) -> None:
+    def test_real_duplicates_are_preserved_as_individual_expected_items(self) -> None:
         source = self._csv("duplicate.csv", "CAIXA_ESTOQUE\n0001\n0002\n0001\n")
-        with self.assertRaisesRegex(ExcelReadError, r"0001 \(linhas 2, 4\)"):
-            self.importer.read_carton_codes(source, ".csv")
+        self.assertEqual(["0001", "0002", "0001"], self.importer.read_carton_codes(source, ".csv"))
 
     def test_empty_cells_do_not_create_cartons(self) -> None:
         source = self._csv("empty.csv", "CAIXA_ESTOQUE\n\n  \n0001\n")
