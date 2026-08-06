@@ -11,43 +11,38 @@
         <header class="page-header">
             <div>
                 <p class="eyebrow">CONFERÊNCIA FÍSICA</p>
-                <h1>Conferência de Volumetria</h1>
             </div>
             <button id="logout-button" class="secondary icon-button" type="button" title="Trocar colaborador" aria-label="Trocar colaborador">⇄</button>
         </header>
 
-        <div id="notice" class="notice" aria-live="polite"></div>
-
-        <section id="upload-card" class="card" hidden>
-            <button id="new-import-button" type="button">Nova importação</button>
-        </section>
-        <section id="sync-card" class="card sync-card" hidden>
-            <span id="pending-sync-count" class="helper">0 conferências pendentes de sincronização</span>
-            <button id="sync-pending-button" class="secondary" type="button" disabled>Sincronizar pendentes</button>
-            <span id="pending-sync-result" class="helper" aria-live="polite"></span>
+        <section id="actions-card" class="card actions-card" hidden>
+            <div class="actions-card-row">
+                <div class="sync-actions">
+                    <button id="sync-pending-button" class="secondary" type="button" disabled>Sincronizar pendentes</button>
+                    <span id="pending-sync-count" class="helper">0 importações pendentes</span>
+                </div>
+                <button id="new-import-button" type="button">Nova importação</button>
+            </div>
         </section>
 
         <section id="conference" class="card" hidden>
             <div class="conference-heading">
-                <div>
-                    <p class="eyebrow">PALETE ATIVO</p>
+                <p class="eyebrow">PALETE ATIVO</p>
+                <div class="conference-heading-state">
                     <h2 id="summary-id"></h2>
-                    <p id="summary-file" class="helper"></p>
+                    <span id="summary-status" class="status-badge"></span>
                 </div>
-                <span id="summary-status" class="status-badge"></span>
             </div>
+            <p id="summary-file" class="helper"></p>
 
-            <div class="identity-row">
-                <span>Colaborador <strong id="summary-collaborator"></strong></span>
-                <span>Tentativa <strong id="summary-attempt"></strong></span>
-                <span>Tempo <strong id="summary-timer">00:00:00</strong></span>
-            </div>
-            <div class="identity-row import-metadata">
-                <span>Agenda <strong id="summary-agenda"></strong></span>
-                <span>Origem <strong id="summary-origin"></strong></span>
-                <span>Operação <strong id="summary-operation"></strong></span>
-                <span>Turno <strong id="summary-shift"></strong></span>
-                <span>Importado em <strong id="summary-imported-at"></strong></span>
+            <div class="conference-metadata" aria-label="Informações da conferência">
+                <span>Origem: <strong id="summary-origin"></strong></span>
+                <span>Operação: <strong id="summary-operation"></strong></span>
+                <span>Turno: <strong id="summary-shift"></strong></span>
+                <span>Importado em: <strong id="summary-imported-at"></strong></span>
+                <span>Colaborador: <strong id="summary-collaborator"></strong></span>
+                <span>Tentativa: <strong id="summary-attempt"></strong></span>
+                <span>Tempo: <strong id="summary-timer">00:00:00</strong></span>
                 <span id="summary-finalized-wrap" hidden><span id="summary-ended-label">Finalizada em</span> <strong id="summary-finalized-at"></strong></span>
             </div>
 
@@ -63,22 +58,22 @@
 
             <progress id="progress" value="0" max="100" aria-label="Progresso da conferência"></progress>
 
-            <form id="carton-form" class="scan-form">
-                <label for="carton-code">
-                    Bipar caixa
-                    <input id="carton-code" autocomplete="off" required
-                           aria-describedby="scan-helper">
-                </label>
-            </form>
-            <p id="scan-helper" class="helper">Bipe ou cole o código; a conferência é automática.</p>
-            <p id="completion-notice" class="notice warning" hidden>100% conferido — aguardando finalização</p>
-            <p id="historical-notice" class="notice warning" hidden>Resultado de uma conferência anterior — somente consulta.</p>
-
-            <div class="conference-actions">
-                <button id="finish-button" type="button">Finalizar conferência</button>
-                <button id="cancel-conference-button" class="danger-button" type="button">Cancelar conferência</button>
-                <button id="authorize-reconference-button" class="danger-outline" type="button" hidden>Autorizar reconferência</button>
+            <div class="scan-controls">
+                <form id="carton-form" class="scan-form">
+                    <label for="carton-code">
+                        Bipar caixa
+                        <input id="carton-code" autocomplete="off" required
+                               aria-describedby="scan-helper">
+                    </label>
+                </form>
+                <div class="conference-actions">
+                    <button id="finish-button" type="button">Finalizar conferência</button>
+                    <button id="cancel-conference-button" class="danger-button" type="button">Cancelar conferência</button>
+                    <button id="authorize-reconference-button" class="danger-outline" type="button" hidden>Autorizar reconferência</button>
+                </div>
             </div>
+            <p id="scan-helper" class="helper">Bipe ou cole o código; a conferência é automática.</p>
+
 
             <div class="lists-grid">
                 <section>
@@ -111,22 +106,22 @@
         <dialog id="import-modal" aria-labelledby="import-title">
             <form id="import-form" method="dialog">
                 <div class="dialog-heading"><h2 id="import-title">Nova importação</h2><button id="import-close" class="close-button" type="button" aria-label="Fechar">×</button></div>
-                <p class="helper">1. Selecione a origem</p>
-                <div class="choice-grid" role="radiogroup" aria-label="Origem">
-                    <button type="button" class="choice-button" data-origin="PORTAL">Portal</button>
-                    <button type="button" class="choice-button" data-origin="TL">TL</button>
+                <p class="helper">1. Arquivo</p>
+                <p id="automatic-file" class="helper" aria-live="polite"></p>
+                <label for="pallet-file">Escolher arquivo<input id="pallet-file" name="file" type="file" accept=".xlsx,.csv"></label>
+                <div id="import-dropzone" class="dropzone" tabindex="0">Arraste o arquivo aqui ou use o seletor acima.</div>
+                <p class="helper">2. Selecione a origem</p>
+                <div id="origin-choices" class="choice-grid" role="radiogroup" aria-label="Origem" aria-disabled="true">
+                    <button type="button" class="choice-button" data-origin="PORTAL" disabled>Portal</button>
+                    <button type="button" class="choice-button" data-origin="TL" disabled>TL</button>
                 </div>
-                <p class="helper">2. Selecione a operação</p>
+                <p class="helper">3. Selecione a operação</p>
                 <div id="operation-choices" class="choice-grid" role="radiogroup" aria-label="Operação" aria-disabled="true">
                     <button type="button" class="choice-button" data-operation="DIGITAL" disabled>Digital</button>
                     <button type="button" class="choice-button" data-operation="NIKESTORE" disabled>Nike Store</button>
                     <button type="button" class="choice-button" data-operation="CROSS" disabled>Cross</button>
                 </div>
-                <p class="helper">3. Arquivo</p>
-                <p id="automatic-file" class="helper" aria-live="polite"></p>
-                <label for="pallet-file">Escolher arquivo<input id="pallet-file" name="file" type="file" accept=".xlsx,.csv" disabled></label>
-                <div id="import-dropzone" class="dropzone" tabindex="0">Arraste o arquivo aqui ou use o seletor acima.</div>
-                <p id="import-summary" class="helper">Selecione origem, operação e arquivo para revisar a importação.</p>
+                <p id="import-summary" class="helper">Selecione o arquivo, a origem e a operação para revisar a importação.</p>
                 <div class="dialog-actions"><button id="import-confirm" type="submit" disabled>Importar e Iniciar a Conferência</button></div>
             </form>
         </dialog>

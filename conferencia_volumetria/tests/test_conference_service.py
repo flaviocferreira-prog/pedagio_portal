@@ -1099,12 +1099,45 @@ class StaticInterfaceContractTests(unittest.TestCase):
         self.assertNotIn("matricula", self.upload_js.casefold())
         self.assertNotIn("registration", self.upload_js.casefold())
 
-    def test_active_conference_screen_is_backend_recovered_and_upload_card_is_exclusive(self) -> None:
-        self.assertIn('id="upload-card" class="card" hidden', self.conference)
+    def test_import_choice_cards_are_compact_only_inside_import_modal(self) -> None:
+        styles = (self.root / "static/styles.css").read_text(encoding="utf-8")
+        self.assertIn("#import-modal .choice-grid", styles)
+        self.assertIn("#import-modal .choice-button { min-height: 40px; padding: 6px 10px; }", styles)
+        self.assertIn(".choice-button.selected", styles)
+
+    def test_notifications_use_one_floating_toast_system(self) -> None:
+        notifications = (self.root / "static/js/notifications.js").read_text(encoding="utf-8")
+        styles = (self.root / "static/styles.css").read_text(encoding="utf-8")
+        self.assertIn('element.id = "toast-container"', notifications)
+        self.assertIn("const DURATIONS = { success: 3000, info: 4000, attention: 5000, error: 7000 }", notifications)
+        self.assertIn("activeToasts", notifications)
+        self.assertIn('close.setAttribute("aria-label", "Fechar notificação")', notifications)
+        self.assertIn("position: fixed", styles)
+        self.assertIn(".toast--success", styles)
+        self.assertIn(".toast--error", styles)
+        self.assertIn(".toast--attention", styles)
+        self.assertIn(".toast--info", styles)
+        self.assertNotIn('id="notice"', self.conference)
+        self.assertNotIn('id="notice"', self.access)
+        self.assertNotIn('id="cadastro-msg"', self.access)
+
+    def test_import_modal_starts_with_file_and_progressively_enables_options(self) -> None:
+        self.assertLess(self.conference.index("1. Arquivo"), self.conference.index("2. Selecione a origem"))
+        self.assertLess(self.conference.index("2. Selecione a origem"), self.conference.index("3. Selecione a operação"))
+        self.assertIn('id="origin-choices"', self.conference)
+        self.assertIn('data-origin="PORTAL" disabled', self.conference)
+        self.assertNotIn('id="pallet-file" name="file" type="file" accept=".xlsx,.csv" disabled', self.conference)
+        self.assertIn("const fileReady = validFile(file) || Boolean(automaticFile);", self.upload_js)
+        self.assertIn("const operationReady = fileReady && Boolean(origin);", self.upload_js)
+        self.assertIn("if (!fileReady) { origin = \"\"; operation = \"\"; }", self.upload_js)
+        self.assertIn("Selecione o arquivo, a origem e a operação para revisar a importação.", self.upload_js)
+
+    def test_active_conference_screen_is_backend_recovered_and_new_import_is_exclusive(self) -> None:
+        self.assertIn('id="actions-card" class="card actions-card" hidden', self.conference)
         self.assertIn("loadActiveConference", (self.root / "static/js/main.js").read_text(encoding="utf-8"))
         self.assertIn("routes.activeConference", self.conference_js)
-        self.assertIn('$("#upload-card").hidden = isActiveConference(data)', self.conference_js)
-        self.assertIn('$("#upload-card").hidden = false', self.conference_js)
+        self.assertIn('$("#new-import-button").hidden = isActiveConference(data)', self.conference_js)
+        self.assertIn('$("#new-import-button").hidden = false', self.conference_js)
         self.assertIn('await load(created.public_id, created)', self.upload_js)
         self.assertNotIn("new Date().toLocaleString", self.upload_js)
 
@@ -1127,7 +1160,8 @@ class StaticInterfaceContractTests(unittest.TestCase):
     def test_manual_finish_modal_and_open_status_contract_exist(self) -> None:
         self.assertIn('id="finish-modal"', self.conference)
         self.assertIn('id="finish-form"', self.conference)
-        self.assertIn("100% conferido — aguardando finalização", self.conference)
+        self.assertNotIn('id="completion-notice"', self.conference)
+        self.assertIn("100% conferido — aguardando finalização", self.conference_js)
         self.assertIn('data.status === "EM_ABERTO"', self.conference_js)
         self.assertIn('finishModal.close(); showImportCard();', self.conference_js)
         self.assertIn('addEventListener("submit", async (event)', self.conference_js)

@@ -1,5 +1,5 @@
 import { api } from "./api-client.js";
-import { notify, notifyElement } from "./notifications.js";
+import { notify } from "./notifications.js";
 
 const accessForm = document.querySelector("#access-form");
 const accessInput = document.querySelector("#matricula");
@@ -24,7 +24,6 @@ function openRegistration() {
   registerForm.reset();
   registrationInput.readOnly = false;
   registerButton.textContent = "Cadastrar";
-  notifyElement("#cadastro-msg", "");
   modal.showModal();
   registrationInput.focus();
 }
@@ -46,7 +45,6 @@ document.querySelector("#btn-editar-colaborador").addEventListener("click", asyn
     nameInput.value = collaborator.nome;
     shiftInput.value = collaborator.turno;
     registerButton.textContent = "Salvar alterações";
-    notifyElement("#cadastro-msg", "");
     modal.showModal();
     nameInput.focus();
   } catch (error) {
@@ -85,7 +83,7 @@ registerForm.addEventListener("submit", async (event) => {
     notify(editing ? "Colaborador atualizado." : "Colaborador cadastrado. Clique em Acessar para continuar.");
     accessButton.focus();
   } catch (error) {
-    notifyElement("#cadastro-msg", error.message, "error");
+    notify(error.message, "error");
     shiftInput.focus();
   } finally {
     registering = false;

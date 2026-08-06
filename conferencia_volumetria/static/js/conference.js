@@ -25,8 +25,8 @@ function isActiveConference(data) { return data && data.status === "EM_ABERTO"; 
 export async function refreshPendingSyncs() {
   const result = await api(routes.pendingSynchronizations);
   const count = result.pending || 0;
-  $("#sync-card").hidden = false;
-  $("#pending-sync-count").textContent = `${count} conferência${count === 1 ? "" : "s"} pendente${count === 1 ? "" : "s"} de sincronização`;
+  $("#actions-card").hidden = false;
+  $("#pending-sync-count").textContent = `${count} ${count === 1 ? "importação pendente" : "importações pendentes"}`;
   $("#sync-pending-button").disabled = syncing || count === 0;
   return count;
 }
@@ -38,7 +38,7 @@ export function showImportCard() {
   $("#carton-list").replaceChildren();
   $("#extra-list").replaceChildren();
   boxElements.clear();
-  ["#summary-id", "#summary-file", "#summary-agenda", "#summary-origin", "#summary-operation", "#summary-shift", "#summary-imported-at", "#summary-finalized-at", "#summary-collaborator", "#summary-attempt"].forEach((selector) => { $(selector).textContent = ""; });
+  ["#summary-id", "#summary-file", "#summary-origin", "#summary-operation", "#summary-shift", "#summary-imported-at", "#summary-finalized-at", "#summary-collaborator", "#summary-attempt"].forEach((selector) => { $(selector).textContent = ""; });
   ["#summary-expected", "#summary-confirmed", "#summary-pending", "#summary-surplus", "#summary-duplicate"].forEach((selector) => { $(selector).textContent = "0"; });
   $("#summary-coverage").textContent = "0%";
   $("#summary-pallet-class").textContent = "NÃO INFORMADO";
@@ -46,24 +46,24 @@ export function showImportCard() {
   $("#box-count").textContent = "0 caixas";
   $("#extra-count").textContent = "0 divergentes";
   $("#summary-finalized-wrap").hidden = true;
-  $("#completion-notice").hidden = true;
-  $("#historical-notice").hidden = true;
   $("#conference").hidden = true;
-  $("#upload-card").hidden = false;
+  $("#actions-card").hidden = false;
+  $("#new-import-button").hidden = false;
   startTimer({});
   refreshPendingSyncs().catch((error) => notify(error.message, "error"));
 }
 
 function renderSummary(data) {
   if (!data) { showImportCard(); return false; }
+  const previousConference = conference;
   conference = data;
   sessionStorage.setItem("conference_public_id", data.public_id);
-  $("#upload-card").hidden = isActiveConference(data);
+  $("#actions-card").hidden = false;
+  $("#new-import-button").hidden = isActiveConference(data);
   $("#conference").hidden = false;
   $("#summary-id").textContent = data.public_id;
   $("#summary-file").textContent = data.source_filename;
   const imported = data.importation || {};
-  $("#summary-agenda").textContent = imported.agenda || "Não informada";
   $("#summary-origin").textContent = imported.origin || "Não informada";
   $("#summary-operation").textContent = imported.operation === "NIKESTORE" ? "Nike Store" : (imported.operation || "Não informada");
   $("#summary-shift").textContent = imported.shift || "Não informado";
@@ -93,9 +93,13 @@ function renderSummary(data) {
   $("#finish-button").disabled = !summary.can_finish;
   $("#finish-button").classList.toggle("ready-to-finish", active && summary.can_finish);
   $("#cancel-conference-button").hidden = !active;
-  $("#completion-notice").hidden = !(active && summary.can_finish);
-  $("#historical-notice").hidden = data.action !== "already_completed";
   $("#authorize-reconference-button").hidden = !data.can_authorize_reconference;
+  if (active && summary.can_finish && !previousConference?.summary?.can_finish) {
+    notify("100% conferido — aguardando finalização.", "attention", { id: `finish-ready-${data.public_id}` });
+  }
+  if (data.action === "already_completed" && previousConference?.public_id !== data.public_id) {
+    notify("Resultado de uma conferência anterior — somente consulta.", "info", { id: `historical-${data.public_id}` });
+  }
   startTimer(data);
   refreshPendingSyncs().catch(() => {});
   return true;
@@ -154,7 +158,7 @@ async function failSync(code) {
   clearTimeout(syncTimeout);
   try { await api(`/sincronizacao/${encodeURIComponent(syncContext.public_id)}/erro/`, { method: "POST", body: JSON.stringify({ code, attempt_id: syncContext.attempt_id, nonce: syncContext.nonce }) }); } catch {}
   syncing = false; syncContext = null;
-  $("#pending-sync-result").textContent = `Sincronização interrompida. ${synchronizedCount} sincronizada(s); as demais permanecem pendentes.`;
+  notify(`Falha ao sincronizar. ${synchronizedCount} sincronizada(s); as demais permanecem pendentes.`, "error", { id: "pending-sync-result" });
   await refreshPendingSyncs();
 }
 
@@ -164,11 +168,10 @@ async function prepareNextSync() {
   if (!prepared) {
     syncing = false; syncContext = null; clearTimeout(syncTimeout);
     if (syncPopup && !syncPopup.closed) syncPopup.close();
-    $("#pending-sync-result").textContent = `Sincronização concluída: ${synchronizedCount} sincronizada(s), ${result.pending || 0} pendente(s).`;
+    notify(`${synchronizedCount} conferência(s) sincronizada(s) com sucesso. ${result.pending || 0} pendente(s).`, "success", { id: "pending-sync-result" });
     await refreshPendingSyncs(); return;
   }
   syncContext = prepared;
-  $("#pending-sync-result").textContent = `Sincronizando ${synchronizedCount + 1}ª conferência...`;
   submitSyncPopup(prepared);
   clearTimeout(syncTimeout);
   syncTimeout = setTimeout(() => failSync("GOOGLE_BRIDGE_TIMEOUT"), GOOGLE_BRIDGE_TIMEOUT_MS);
@@ -178,7 +181,7 @@ async function startPendingSynchronization() {
   if (syncing) return;
   syncPopup = window.open("", "google_sync", "popup=yes,width=520,height=650,resizable=yes,scrollbars=yes");
   if (!syncPopup) { notify("Popup bloqueado. Permita janelas para sincronizar.", "error"); return; }
-  syncing = true; synchronizedCount = 0; $("#pending-sync-result").textContent = "Preparando sincronização manual...";
+  syncing = true; synchronizedCount = 0;
   try { await prepareNextSync(); } catch (error) { await failSync(error.code === "NETWORK_ERROR" ? "NETWORK_ERROR" : "LOCAL_CONFIRMATION_FAILED"); notify(error.message, "error"); }
 }
 
@@ -197,7 +200,7 @@ export function bindConference() {
   async function processScan(value) {
     const caixaEstoque = normalizeCaixaEstoque(value); if (scanning || !conference || conference.status !== "EM_ABERTO" || !caixaEstoque) return;
     scanning = true; input.disabled = true; const sequence = ++scanSequence;
-    try { const result = await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/scan`, { method: "POST", body: JSON.stringify({ caixa_estoque: caixaEstoque }) }); if (sequence === scanSequence) { render(result); input.value = ""; notify(result.message, result.result === "CONFERIDA" ? "success" : result.result === "DUPLICADA" ? "warning" : "error"); } }
+    try { const result = await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/scan`, { method: "POST", body: JSON.stringify({ caixa_estoque: caixaEstoque }) }); if (sequence === scanSequence) { render(result); input.value = ""; if (result.result !== "CONFERIDA") notify(result.message, result.result === "DUPLICADA" ? "attention" : "error"); } }
     catch (error) { if (sequence === scanSequence) { notify(error.message, "error"); input.select(); } }
     finally { if (sequence === scanSequence) { scanning = false; input.disabled = false; input.focus(); } }
   }

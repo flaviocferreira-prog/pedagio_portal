@@ -15,6 +15,7 @@ let origin = "";
 let operation = "";
 let importing = false;
 let automaticFile = null;
+let fileSelectionTouched = false;
 
 async function base64(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
@@ -33,29 +34,38 @@ function validFile(file) {
 
 function updateModal() {
   const file = fileInput.files?.[0];
-  const originReady = Boolean(origin);
+  const fileReady = validFile(file) || Boolean(automaticFile);
+  if (!fileReady) { origin = ""; operation = ""; }
+  const originReady = fileReady;
+  const operationReady = fileReady && Boolean(origin);
   const selectedFilename = file?.name || automaticFile?.filename || "";
-  document.querySelectorAll("[data-origin]").forEach((button) => button.classList.toggle("selected", button.dataset.origin === origin));
-  document.querySelectorAll("[data-operation]").forEach((button) => { button.disabled = !originReady; button.classList.toggle("selected", button.dataset.operation === operation); });
-  fileInput.disabled = !(origin && operation);
+  document.querySelectorAll("[data-origin]").forEach((button) => { button.disabled = !originReady; button.classList.toggle("selected", button.dataset.origin === origin); });
+  document.querySelectorAll("[data-operation]").forEach((button) => { button.disabled = !operationReady; button.classList.toggle("selected", button.dataset.operation === operation); });
+  document.querySelector("#origin-choices").setAttribute("aria-disabled", String(!originReady));
+  document.querySelector("#operation-choices").setAttribute("aria-disabled", String(!operationReady));
   const collaborator = collaboratorSummary();
-  const ready = origin && operation && (validFile(file) || automaticFile) && collaborator.nome && ["T1", "T2", "T3", "ADM"].includes(collaborator.turno);
+  const ready = fileReady && origin && operation && collaborator.nome && ["T1", "T2", "T3", "ADM"].includes(collaborator.turno);
   confirmButton.disabled = !ready || importing;
   summary.textContent = ready
     ? `Origem: ${origin === "PORTAL" ? "Portal" : "TL"} | Operação: ${operation === "NIKESTORE" ? "Nike Store" : operation} | Arquivo: ${selectedFilename} | Colaborador: ${collaborator.nome} | Turno: ${collaborator.turno}`
-    : "Selecione origem, operação e arquivo para revisar a importação.";
+    : "Selecione o arquivo, a origem e a operação para revisar a importação.";
 }
 
 function resetModal() {
-  origin = ""; operation = ""; importing = false; automaticFile = null; form.reset();
+  origin = ""; operation = ""; importing = false; automaticFile = null; fileSelectionTouched = false; form.reset();
   automaticFileNotice.textContent = "Buscando o relatório mais recente do WMS na pasta Downloads...";
   closeButton.disabled = false; confirmButton.textContent = "Importar e iniciar conferência"; updateModal();
 }
 
 function setFile(file) {
-  if (!validFile(file)) { notify("Selecione um arquivo .xlsx ou .csv de até 10 MB.", "error"); return; }
+  if (!validFile(file)) {
+    automaticFile = null; fileSelectionTouched = true;
+    automaticFileNotice.textContent = "Selecione um arquivo .xlsx ou .csv de até 10 MB.";
+    updateModal(); notify("Selecione um arquivo .xlsx ou .csv de até 10 MB.", "error"); return;
+  }
   const transfer = new DataTransfer(); transfer.items.add(file); fileInput.files = transfer.files;
-  automaticFile = null; automaticFileNotice.textContent = "Arquivo selecionado manualmente."; updateModal();
+  automaticFile = null; fileSelectionTouched = true; automaticFileNotice.textContent = "Arquivo selecionado manualmente."; updateModal();
+  notify("Arquivo selecionado com sucesso.", "success", { id: "file-selected" });
 }
 
 async function findLatestAutomaticFile() {
@@ -65,8 +75,10 @@ async function findLatestAutomaticFile() {
       automaticFileNotice.textContent = "Nenhum relatório recente do WMS foi encontrado na pasta Downloads. Selecione o arquivo manualmente.";
       return;
     }
+    if (fileSelectionTouched || fileInput.files?.[0]) return;
     automaticFile = result;
     automaticFileNotice.textContent = `Arquivo mais recente encontrado: Nome: ${result.filename} | Baixado em: ${result.downloaded_at}`;
+    notify("Arquivo mais recente localizado.", "info", { id: "automatic-file-found" });
   } catch {
     automaticFileNotice.textContent = "Nenhum relatório recente do WMS foi encontrado na pasta Downloads. Selecione o arquivo manualmente.";
   } finally {
@@ -78,9 +90,9 @@ export function bindUpload() {
   document.querySelector("#new-import-button").addEventListener("click", () => { resetModal(); modal.showModal(); findLatestAutomaticFile(); });
   closeButton.addEventListener("click", () => { if (!importing) modal.close(); });
   modal.addEventListener("cancel", (event) => { if (importing) event.preventDefault(); });
-  document.querySelectorAll("[data-origin]").forEach((button) => button.addEventListener("click", () => { origin = button.dataset.origin; operation = ""; updateModal(); }));
+  document.querySelectorAll("[data-origin]").forEach((button) => button.addEventListener("click", () => { if (button.disabled) return; origin = button.dataset.origin; operation = ""; updateModal(); }));
   document.querySelectorAll("[data-operation]").forEach((button) => button.addEventListener("click", () => { operation = button.dataset.operation; updateModal(); }));
-  fileInput.addEventListener("change", () => { const file = fileInput.files?.[0]; if (file) setFile(file); else updateModal(); });
+  fileInput.addEventListener("change", () => { const file = fileInput.files?.[0]; if (file) setFile(file); else { automaticFile = null; fileSelectionTouched = true; automaticFileNotice.textContent = "Selecione um arquivo para liberar as próximas etapas."; updateModal(); notify("Selecione um arquivo para continuar.", "attention", { id: "file-required" }); } });
   ["dragenter", "dragover"].forEach((eventName) => dropzone.addEventListener(eventName, (event) => { event.preventDefault(); dropzone.classList.add("dragging"); }));
   ["dragleave", "drop"].forEach((eventName) => dropzone.addEventListener(eventName, (event) => { event.preventDefault(); dropzone.classList.remove("dragging"); }));
   dropzone.addEventListener("drop", (event) => setFile(event.dataTransfer.files[0]));
