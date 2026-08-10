@@ -15,6 +15,7 @@ let identifying = false;
 let registering = false;
 let editing = false;
 
+
 document.querySelectorAll('input[type="text"], textarea').forEach((input) => {
   input.addEventListener("input", () => { input.value = input.value.toUpperCase(); });
 });

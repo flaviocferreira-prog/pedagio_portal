@@ -2,6 +2,9 @@
 data/*.db
 data/temporary_uploads/
 *.db
+*.db-journal
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 
@@ -24,12 +27,12 @@ htmlcov/
 !.env.example
 *.pem
 *.key
-credentials.json
-service-account*.json
-google-credentials*.json
 .vscode/
 .idea/
-logs/
+logs/*
+!logs/.gitkeep
+backups/*
+!backups/.gitkeep
 *.log
 temp/
 tmp/

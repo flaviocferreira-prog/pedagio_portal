@@ -12,18 +12,28 @@
             <div>
                 <p class="eyebrow">CONFERÊNCIA FÍSICA</p>
             </div>
-            <button id="logout-button" class="secondary icon-button" type="button" title="Trocar colaborador" aria-label="Trocar colaborador">⇄</button>
-        </header>
-
-        <section id="actions-card" class="card actions-card" hidden>
-            <div class="actions-card-row">
-                <div class="sync-actions">
-                    <button id="sync-pending-button" class="secondary" type="button" disabled>Sincronizar pendentes</button>
-                    <span id="pending-sync-count" class="helper">0 importações pendentes</span>
+            <div class="header-tools">
+                <div class="header-actions" aria-label="Ações da conferência">
+                    <button id="logout-button" class="secondary header-action" type="button" title="Trocar colaborador">
+                        <svg class="header-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h11l-3-3m3 3-3 3M17 17H6l3 3m-3-3 3-3"/></svg>
+                        <span class="header-action__label">Trocar colaborador</span>
+                    </button>
+                    <button id="new-import-button" class="header-action" type="button" title="Nova importação" hidden>
+                        <svg class="header-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                        <span class="header-action__label">Nova importação</span>
+                    </button>
+                    <button id="sync-pending-button" class="secondary header-action" type="button" title="Sincronizar pendentes">
+                        <svg class="header-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 9A7 7 0 0 1 18.5 6.5L20 12M4 12l1.5 5.5A7 7 0 0 0 17.9 15"/></svg>
+                        <span class="header-action__label">Sincronizar pendentes</span>
+                        <span id="sync-pending-count" class="sync-count" hidden>0</span>
+                    </button>
                 </div>
-                <button id="new-import-button" type="button">Nova importação</button>
+                <p id="sync-status" class="sync-status" data-state="unknown" aria-live="polite">
+                    <span class="sync-status__dot" aria-hidden="true"></span>
+                    <span id="sync-status-text">Verificando sincronização...</span>
+                </p>
             </div>
-        </section>
+        </header>
 
         <section id="conference" class="card" hidden>
             <div class="conference-heading">
@@ -50,7 +60,7 @@
                 <article><span>Esperadas</span><strong id="summary-expected">0</strong></article>
                 <article><span>Conferidas</span><strong id="summary-confirmed">0</strong></article>
                 <article><span>Faltantes</span><strong id="summary-pending">0</strong></article>
-                <article class="danger-card"><span>Divergentes</span><strong id="summary-surplus">0</strong></article>
+                <article class="danger-card"><span>Sobras</span><strong id="summary-surplus">0</strong></article>
                 <article><span>Duplicadas</span><strong id="summary-duplicate">0</strong></article>
                 <article><span>Percentual</span><strong id="summary-coverage">0%</strong></article>
                 <article><span>Classe do palete</span><strong id="summary-pallet-class">NÃO INFORMADO</strong></article>
@@ -73,6 +83,12 @@
                 </div>
             </div>
             <p id="scan-helper" class="helper">Bipe ou cole o código; a conferência é automática.</p>
+            <section id="surplus-correction-notice" class="surplus-correction-notice" aria-live="polite" aria-hidden="true" hidden>
+                <strong>CORREÇÃO DE SOBRA</strong>
+                <span>Trate fisicamente a caixa e bipe novamente:</span>
+                <code id="surplus-correction-code"></code>
+                <button id="cancel-surplus-correction" class="secondary" type="button">Cancelar correção</button>
+            </section>
 
 
             <div class="lists-grid">
@@ -85,7 +101,7 @@
                 </section>
                 <section class="extra-panel">
                     <div class="list-heading">
-                        <h3>Divergências</h3>
+                        <h3>Sobras identificadas</h3>
                         <span id="extra-count"></span>
                     </div>
                     <ul id="extra-list" class="extra-list"></ul>
@@ -95,10 +111,16 @@
 
         <dialog id="finish-modal" aria-labelledby="finish-title">
             <form id="finish-form" method="dialog">
-                <h2 id="finish-title">Finalizar conferência</h2>
-                <p>Tem certeza de que deseja finalizar esta conferência? Após finalizar, não será possível bipar, cancelar ou alterar os dados.</p>
+                <h2 id="finish-title"><span id="finish-surplus-icon" class="finish-surplus-icon" aria-hidden="true" hidden>⚠</span><span id="finish-title-text">Finalizar conferência</span></h2>
+                <p id="finish-intro">Tem certeza de que deseja finalizar esta conferência? Após finalizar, não será possível bipar, cancelar ou alterar os dados.</p>
+                <section id="finish-surplus-details" class="finish-surplus-details" aria-labelledby="finish-surplus-list-title" hidden>
+                    <p id="finish-surplus-warning" class="finish-surplus-warning" hidden></p>
+                    <p class="finish-surplus-guidance">Antes de finalizar, verifique e trate fisicamente todas as sobras no palete.</p>
+                    <h3 id="finish-surplus-list-title">Sobras identificadas</h3>
+                    <ul id="finish-surplus-list" class="finish-surplus-list"></ul>
+                </section>
                 <div class="dialog-actions">
-                    <button id="finish-cancel" class="secondary" type="button">Voltar</button>
+                    <button id="finish-cancel" class="secondary" type="button">Voltar para a conferência</button>
                     <button id="finish-confirm" type="submit">Confirmar finalização</button>
                 </div>
             </form>
@@ -148,6 +170,12 @@
             </form>
         </dialog>
     </main>
+    <aside id="surplus-alert" class="surplus-alert" role="alert" aria-live="assertive" aria-atomic="true" hidden aria-hidden="true">
+        <strong id="surplus-alert-title"></strong>
+        <span id="surplus-alert-summary"></span>
+        <span id="surplus-alert-code"></span>
+        <span id="surplus-alert-guidance"></span>
+    </aside>
     <script type="module" src="/static/js/main.js"></script>
 </body>
 </html>

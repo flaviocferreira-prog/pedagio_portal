@@ -2,6 +2,9 @@
 **/data/*.db
 **/data/temporary_uploads/
 *.db
+*.db-journal
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 
@@ -24,6 +27,8 @@ htmlcov/
 .env
 .env.*
 !.env.example
+**/credentials/*
+!**/credentials/.gitkeep
 *.pem
 *.key
 credentials.json
@@ -38,7 +43,10 @@ Thumbs.db
 desktop.ini
 
 # Logs e temporarios
-logs/
+**/logs/*
+!**/logs/.gitkeep
+**/backups/*
+!**/backups/.gitkeep
 *.log
 temp/
 tmp/

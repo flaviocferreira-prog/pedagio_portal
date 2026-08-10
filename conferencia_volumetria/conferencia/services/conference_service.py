@@ -23,6 +23,8 @@ from conferencia.repositories.pallet_repository import (
     PalletRepository,
     PendingConferenceError,
     RepositoryStateError,
+    SurplusCorrectionMismatchError,
+    SurplusTreatmentRequiredError,
 )
 
 
@@ -309,7 +311,11 @@ class ConferenceService:
         return result
 
     def finish_pallet(
-        self, public_id: str, collaborator: CollaboratorContext
+        self,
+        public_id: str,
+        collaborator: CollaboratorContext,
+        *,
+        confirm_surpluses: bool = False,
     ) -> dict:
         actor, pallet = self._pallet_for_collaborator(public_id, collaborator)
         if pallet["conference_status"] == "CANCELADA":
@@ -319,7 +325,20 @@ class ConferenceService:
             result["message"] = "A conferência já está finalizada."
             return result
         try:
-            self.repository.finish(pallet["id"], actor)
+            self.repository.finish(
+                pallet["id"],
+                actor,
+                confirm_surpluses=confirm_surpluses is True,
+            )
+        except SurplusTreatmentRequiredError as error:
+            raise ConflictError(
+                "Esta conferência possui sobras que ainda não tiveram o tratamento confirmado.",
+                code="SOBRAS_SEM_TRATAMENTO",
+                details={
+                    "sobras": error.surplus_count,
+                    "requires_surplus_treatment": True,
+                },
+            ) from error
         except PendingConferenceError as error:
             raise ConflictError(
                 "Não é possível finalizar a conferência.",
@@ -337,6 +356,55 @@ class ConferenceService:
             self._raise_state_error(error, action="finish")
         result = self.get_pallet(pallet["public_id"])
         result["message"] = "Conferência finalizada com sucesso."
+        return result
+
+    def correct_surplus(
+        self,
+        public_id: str,
+        surplus_event_id: object,
+        carton_code: object,
+        collaborator: CollaboratorContext,
+    ) -> dict:
+        actor, pallet = self._pallet_for_collaborator(public_id, collaborator)
+        if isinstance(surplus_event_id, bool):
+            raise ValidationError("Informe o evento de sobra para corrigir.", code="SOBRA_EVENTO_INVALIDO")
+        try:
+            event_id = int(str(surplus_event_id).strip())
+        except (TypeError, ValueError):
+            raise ValidationError("Informe o evento de sobra para corrigir.", code="SOBRA_EVENTO_INVALIDO") from None
+        if event_id <= 0:
+            raise ValidationError("Informe o evento de sobra para corrigir.", code="SOBRA_EVENTO_INVALIDO")
+        code = normalize_caixa_estoque(carton_code)
+        if not code:
+            raise InvalidScanError("Código da caixa é obrigatório.")
+        try:
+            pending = self.repository.correct_surplus(pallet["id"], event_id, code, actor)
+        except SurplusCorrectionMismatchError as error:
+            raise ConflictError(
+                "Código incorreto. Bipe novamente a caixa correta.",
+                code="CODIGO_CORRECAO_INCORRETO",
+                details={"expected_code": error.expected_code, "scanned_code": error.scanned_code},
+            ) from error
+        except RepositoryStateError as error:
+            if error.state == "SURPLUS_NOT_FOUND":
+                raise ConflictError(
+                    "A sobra selecionada não pertence à conferência ativa.",
+                    code="SOBRA_NAO_ENCONTRADA",
+                ) from error
+            if error.state == "SURPLUS_ALREADY_CORRECTED":
+                raise ConflictError(
+                    "Esta sobra já foi corrigida.", code="SOBRA_JA_CORRIGIDA"
+                ) from error
+            self._raise_state_error(error, action="correct_surplus")
+        result = self.get_pallet(pallet["public_id"])
+        result.update(
+            {
+                "message": "Sobra corrigida com sucesso.",
+                "corrected_surplus_event_id": event_id,
+                "caixa_estoque": code,
+                "pending_surpluses": pending,
+            }
+        )
         return result
 
     def cancel_pallet(
@@ -398,8 +466,8 @@ class ConferenceService:
             return "CONFERIDA", "Caixa conferida com sucesso."
         if classification == ScanClassification.EXTRA:
             return (
-                "DIVERGENTE",
-                "Caixa divergente — código não esperado para este palete.",
+                "SOBRA",
+                "SOBRA: código não esperado para este palete.",
             )
         return "DUPLICADA", "Caixa já conferida."
 

@@ -79,9 +79,29 @@ class ConferenceController:
         return self.service.start_pallet(public_id, collaborator)
 
     def finish_pallet(
-        self, public_id: str, collaborator: CollaboratorContext
+        self,
+        public_id: str,
+        payload: dict[str, object],
+        collaborator: CollaboratorContext,
     ) -> dict:
-        return self.service.finish_pallet(public_id, collaborator)
+        return self.service.finish_pallet(
+            public_id,
+            collaborator,
+            confirm_surpluses=payload.get("confirmar_sobras") is True,
+        )
+
+    def correct_surplus(
+        self,
+        public_id: str,
+        payload: dict[str, object],
+        collaborator: CollaboratorContext,
+    ) -> dict:
+        return self.service.correct_surplus(
+            public_id,
+            payload.get("surplus_event_id"),
+            payload.get("caixa_estoque"),
+            collaborator,
+        )
 
     def authorize_reconference(
         self, public_id: str, payload: dict[str, object], collaborator: CollaboratorContext

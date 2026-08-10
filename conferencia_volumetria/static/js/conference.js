@@ -4,35 +4,94 @@ import { startTimer } from "./timer.js";
 
 let conference = null;
 let scanning = false;
+const scanQueue = [];
 let finishing = false;
 let cancelling = false;
 let authorizingReconference = false;
-let scanSequence = 0;
 let scanTimer = null;
-let syncing = false;
-let syncPopup = null;
-let syncContext = null;
-let syncTimeout = null;
-let synchronizedCount = 0;
 const boxElements = new Map();
+let surplusAlertSuppressedForFinish = false;
+let surplusCorrection = null;
 const $ = (selector) => document.querySelector(selector);
 const AUTO_SCAN_DELAY_MS = 160;
-const GOOGLE_BRIDGE_TIMEOUT_MS = 300000;
 
 function normalizeCaixaEstoque(value) { return String(value ?? "").trim(); }
 function isActiveConference(data) { return data && data.status === "EM_ABERTO"; }
+function resetSurplusAlert() {
+  const alert = $("#surplus-alert");
+  surplusAlertSuppressedForFinish = false;
+  alert.hidden = true;
+  alert.setAttribute("aria-hidden", "true");
+  alert.classList.remove("surplus-alert--visible");
+  ["#surplus-alert-title", "#surplus-alert-summary", "#surplus-alert-code", "#surplus-alert-guidance"].forEach((selector) => { $(selector).textContent = ""; });
+}
 
-export async function refreshPendingSyncs() {
-  const result = await api(routes.pendingSynchronizations);
-  const count = result.pending || 0;
-  $("#actions-card").hidden = false;
-  $("#pending-sync-count").textContent = `${count} ${count === 1 ? "importação pendente" : "importações pendentes"}`;
-  $("#sync-pending-button").disabled = syncing || count === 0;
-  return count;
+function renderSurplusAlert(data = conference) {
+  if (!isActiveConference(data)) {
+    resetSurplusAlert();
+    return;
+  }
+  const total = Number(data?.summary?.total_extra || 0);
+  const extras = data?.unexpected_cartons || [];
+  if (total <= 0 || !extras.length) {
+    resetSurplusAlert();
+    return;
+  }
+  const latest = extras.at(-1);
+  const alert = $("#surplus-alert");
+  $("#surplus-alert-title").textContent = total === 1
+    ? "ATENÇÃO — SOBRA IDENTIFICADA"
+    : "ATENÇÃO — SOBRAS IDENTIFICADAS";
+  $("#surplus-alert-summary").textContent = `Esta conferência possui ${total} ${total === 1 ? "sobra" : "sobras"}.`;
+  $("#surplus-alert-code").textContent = `Última caixa identificada: ${normalizeCaixaEstoque(latest?.caixa_estoque) || "Não informada"}`;
+  $("#surplus-alert-guidance").textContent = "Continue a conferência e trate as sobras antes de finalizar.";
+  const shouldDisplay = !surplusAlertSuppressedForFinish;
+  alert.hidden = !shouldDisplay;
+  alert.setAttribute("aria-hidden", String(!shouldDisplay));
+  alert.classList.toggle("surplus-alert--visible", shouldDisplay);
+}
+
+function suppressSurplusAlertForFinish() {
+  surplusAlertSuppressedForFinish = true;
+  renderSurplusAlert();
+}
+
+function restoreSurplusAlertAfterFinishModal() {
+  surplusAlertSuppressedForFinish = false;
+  renderSurplusAlert();
+}
+
+function resetSurplusCorrection() {
+  surplusCorrection = null;
+  const notice = $("#surplus-correction-notice");
+  notice.hidden = true;
+  notice.setAttribute("aria-hidden", "true");
+  $("#surplus-correction-code").textContent = "";
+}
+
+function renderSurplusCorrection(data = conference) {
+  const pending = data?.unexpected_cartons || [];
+  const selected = surplusCorrection && pending.find(
+    (item) => Number(item.event_id) === Number(surplusCorrection.eventId),
+  );
+  if (!isActiveConference(data) || !selected) {
+    resetSurplusCorrection();
+    return;
+  }
+  surplusCorrection = { eventId: selected.event_id, code: selected.caixa_estoque };
+  const notice = $("#surplus-correction-notice");
+  $("#surplus-correction-code").textContent = normalizeCaixaEstoque(selected.caixa_estoque);
+  notice.hidden = false;
+  notice.setAttribute("aria-hidden", "false");
 }
 
 export function showImportCard() {
   conference = null;
+  scanning = false;
+  scanQueue.length = 0;
+  clearTimeout(scanTimer);
+  resetSurplusAlert();
+  resetSurplusCorrection();
   sessionStorage.removeItem("conference_public_id");
   $("#carton-code").value = "";
   $("#carton-list").replaceChildren();
@@ -44,13 +103,11 @@ export function showImportCard() {
   $("#summary-pallet-class").textContent = "NÃO INFORMADO";
   $("#progress").value = 0;
   $("#box-count").textContent = "0 caixas";
-  $("#extra-count").textContent = "0 divergentes";
+  $("#extra-count").textContent = "0 sobras";
   $("#summary-finalized-wrap").hidden = true;
   $("#conference").hidden = true;
-  $("#actions-card").hidden = false;
   $("#new-import-button").hidden = false;
   startTimer({});
-  refreshPendingSyncs().catch((error) => notify(error.message, "error"));
 }
 
 function renderSummary(data) {
@@ -58,7 +115,6 @@ function renderSummary(data) {
   const previousConference = conference;
   conference = data;
   sessionStorage.setItem("conference_public_id", data.public_id);
-  $("#actions-card").hidden = false;
   $("#new-import-button").hidden = isActiveConference(data);
   $("#conference").hidden = false;
   $("#summary-id").textContent = data.public_id;
@@ -86,22 +142,23 @@ function renderSummary(data) {
   $("#summary-pallet-class").textContent = data.pallet_class || "NÃO INFORMADO";
   $("#progress").value = summary.coverage_percent;
   $("#box-count").textContent = `${summary.total_expected} caixas`;
-  $("#extra-count").textContent = `${summary.total_extra} divergentes`;
+  $("#extra-count").textContent = `${summary.total_extra} sobras`;
   const active = data.status === "EM_ABERTO" && Boolean(data.started_at);
   $("#carton-form").hidden = !active;
   $("#finish-button").hidden = !active;
-  $("#finish-button").disabled = !summary.can_finish;
-  $("#finish-button").classList.toggle("ready-to-finish", active && summary.can_finish);
+  const pendingSurpluses = Number(summary.total_extra || 0);
+  const canFinish = summary.can_finish && pendingSurpluses === 0;
+  $("#finish-button").disabled = !canFinish;
+  $("#finish-button").classList.toggle("ready-to-finish", active && canFinish);
   $("#cancel-conference-button").hidden = !active;
   $("#authorize-reconference-button").hidden = !data.can_authorize_reconference;
-  if (active && summary.can_finish && !previousConference?.summary?.can_finish) {
+  if (active && canFinish && !previousConference?.summary?.can_finish) {
     notify("100% conferido — aguardando finalização.", "attention", { id: `finish-ready-${data.public_id}` });
   }
   if (data.action === "already_completed" && previousConference?.public_id !== data.public_id) {
     notify("Resultado de uma conferência anterior — somente consulta.", "info", { id: `historical-${data.public_id}` });
   }
   startTimer(data);
-  refreshPendingSyncs().catch(() => {});
   return true;
 }
 
@@ -125,12 +182,20 @@ function renderExpectedBoxes(boxes, data) {
 }
 
 function renderExtras(extras) {
-  $("#extra-list").replaceChildren(...extras.map((box) => { const item = document.createElement("li"); item.className = "extra-item pending"; const code = document.createElement("strong"); code.textContent = normalizeCaixaEstoque(box.caixa_estoque); item.append(code); return item; }));
+  $("#extra-list").replaceChildren(...extras.map((box) => {
+    const item = document.createElement("li"); item.className = "extra-item pending";
+    const code = document.createElement("strong"); code.textContent = normalizeCaixaEstoque(box.caixa_estoque);
+    const correct = document.createElement("button"); correct.type = "button"; correct.className = "correct-surplus-button";
+    correct.dataset.surplusEventId = String(box.event_id); correct.textContent = "Corrigir sobra";
+    item.replaceChildren(code, correct); return item;
+  }));
 }
 
 export function render(data) {
   if (!renderSummary(data)) return;
   renderExpectedBoxes(data.cartons, data); renderExtras(data.unexpected_cartons || []);
+  renderSurplusAlert(data);
+  renderSurplusCorrection(data);
   if (data.status === "EM_ABERTO") $("#carton-code").focus();
 }
 
@@ -147,68 +212,127 @@ export async function loadActiveConference() {
   showImportCard(); return null;
 }
 
-function submitSyncPopup(prepared) {
-  const form = syncPopup.document.createElement("form"); form.method = "POST"; form.action = prepared.apps_script_url;
-  Object.entries({ modo: "popup", payload: prepared.payload, assinatura: prepared.signature, id_conferencia: prepared.public_id, attempt_id: prepared.attempt_id, parent_origin: prepared.application_origin, return_url: prepared.return_url, nonce: prepared.nonce, popup_token: prepared.popup_token }).forEach(([name, value]) => { const input = syncPopup.document.createElement("input"); input.type = "hidden"; input.name = name; input.value = value; form.append(input); });
-  syncPopup.document.body.replaceChildren(form); form.submit();
-}
-
-async function failSync(code) {
-  if (!syncContext) return;
-  clearTimeout(syncTimeout);
-  try { await api(`/sincronizacao/${encodeURIComponent(syncContext.public_id)}/erro/`, { method: "POST", body: JSON.stringify({ code, attempt_id: syncContext.attempt_id, nonce: syncContext.nonce }) }); } catch {}
-  syncing = false; syncContext = null;
-  notify(`Falha ao sincronizar. ${synchronizedCount} sincronizada(s); as demais permanecem pendentes.`, "error", { id: "pending-sync-result" });
-  await refreshPendingSyncs();
-}
-
-async function prepareNextSync() {
-  const result = await api(routes.preparePendingSynchronizations, { method: "POST", body: "{}" });
-  const prepared = result.prepared;
-  if (!prepared) {
-    syncing = false; syncContext = null; clearTimeout(syncTimeout);
-    if (syncPopup && !syncPopup.closed) syncPopup.close();
-    notify(`${synchronizedCount} conferência(s) sincronizada(s) com sucesso. ${result.pending || 0} pendente(s).`, "success", { id: "pending-sync-result" });
-    await refreshPendingSyncs(); return;
-  }
-  syncContext = prepared;
-  submitSyncPopup(prepared);
-  clearTimeout(syncTimeout);
-  syncTimeout = setTimeout(() => failSync("GOOGLE_BRIDGE_TIMEOUT"), GOOGLE_BRIDGE_TIMEOUT_MS);
-}
-
-async function startPendingSynchronization() {
-  if (syncing) return;
-  syncPopup = window.open("", "google_sync", "popup=yes,width=520,height=650,resizable=yes,scrollbars=yes");
-  if (!syncPopup) { notify("Popup bloqueado. Permita janelas para sincronizar.", "error"); return; }
-  syncing = true; synchronizedCount = 0;
-  try { await prepareNextSync(); } catch (error) { await failSync(error.code === "NETWORK_ERROR" ? "NETWORK_ERROR" : "LOCAL_CONFIRMATION_FAILED"); notify(error.message, "error"); }
-}
-
-async function handleSyncMessage(event) {
-  if (event.origin !== window.location.origin || event.source !== syncPopup || !syncing || !syncContext) return;
-  const data = event.data;
-  if (!data || data.source !== "google-sheets-sync" || data.type !== "GOOGLE_SYNC_RESULT" || data.conference_id !== syncContext.public_id || data.attempt_id !== syncContext.attempt_id || data.nonce !== syncContext.nonce) return;
-  if (data.status === "ERROR") { await failSync(data.error_code || "GOOGLE_SYNC_FAILED"); return; }
-  if (data.status !== "SUCCESS" && data.status !== "ALREADY_SYNCED") { await failSync("GOOGLE_RECEIPT_INVALID"); return; }
-  clearTimeout(syncTimeout); synchronizedCount += 1;
-  try { await prepareNextSync(); } catch (error) { await failSync("LOCAL_CONFIRMATION_FAILED"); notify(error.message, "error"); }
-}
-
 export function bindConference() {
   const cartonForm = $("#carton-form"); const input = $("#carton-code");
-  async function processScan(value) {
-    const caixaEstoque = normalizeCaixaEstoque(value); if (scanning || !conference || conference.status !== "EM_ABERTO" || !caixaEstoque) return;
-    scanning = true; input.disabled = true; const sequence = ++scanSequence;
-    try { const result = await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/scan`, { method: "POST", body: JSON.stringify({ caixa_estoque: caixaEstoque }) }); if (sequence === scanSequence) { render(result); input.value = ""; if (result.result !== "CONFERIDA") notify(result.message, result.result === "DUPLICADA" ? "attention" : "error"); } }
-    catch (error) { if (sequence === scanSequence) { notify(error.message, "error"); input.select(); } }
-    finally { if (sequence === scanSequence) { scanning = false; input.disabled = false; input.focus(); } }
+  async function processNextScan() {
+    if (scanning || !scanQueue.length) return;
+    if (!conference || conference.status !== "EM_ABERTO") { scanQueue.length = 0; return; }
+    const caixaEstoque = scanQueue.shift();
+    const publicId = conference.public_id;
+    const correction = surplusCorrection;
+    scanning = true;
+    try {
+      if (correction) {
+        const result = await api(`/api/conferences/${encodeURIComponent(publicId)}/correct-surplus`, {
+          method: "POST",
+          body: JSON.stringify({ surplus_event_id: correction.eventId, caixa_estoque: caixaEstoque }),
+        });
+        render(result);
+        notify(`Sobra corrigida com sucesso\nCaixa: ${normalizeCaixaEstoque(result.caixa_estoque)}`, "success");
+      } else {
+        const result = await api(`/api/conferences/${encodeURIComponent(publicId)}/scan`, { method: "POST", body: JSON.stringify({ caixa_estoque: caixaEstoque }) });
+        render(result);
+        if (result.result !== "CONFERIDA" && result.result !== "SOBRA") notify(result.message, "attention");
+      }
+    } catch (error) {
+      if (correction && error instanceof ApiError && error.code === "CODIGO_CORRECAO_INCORRETO") {
+        notify(`Código incorreto\nEsperado: ${normalizeCaixaEstoque(error.details.expected_code)}\nLido: ${normalizeCaixaEstoque(error.details.scanned_code)}\nBipe novamente a caixa correta.`, "error");
+      } else if (correction && error instanceof ApiError && ["SOBRA_JA_CORRIGIDA", "SOBRA_NAO_ENCONTRADA"].includes(error.code)) {
+        resetSurplusCorrection();
+        notify(error.message, "error");
+      } else {
+        notify(error instanceof ApiError ? error.message : error.message, "error");
+      }
+    } finally {
+      scanning = false;
+      if (conference?.status === "EM_ABERTO") input.focus();
+      processNextScan();
+    }
   }
-  function scheduleScan() { clearTimeout(scanTimer); const value = normalizeCaixaEstoque(input.value); if (value && !scanning) scanTimer = setTimeout(() => processScan(value), AUTO_SCAN_DELAY_MS); }
-  cartonForm.addEventListener("submit", (event) => { event.preventDefault(); clearTimeout(scanTimer); processScan(input.value); }); input.addEventListener("input", scheduleScan); input.addEventListener("paste", () => setTimeout(scheduleScan, 0));
-  const finishModal = $("#finish-modal"); $("#finish-button").addEventListener("click", () => { if (conference?.status === "EM_ABERTO") finishModal.showModal(); }); $("#finish-cancel").addEventListener("click", () => finishModal.close());
-  $("#finish-form").addEventListener("submit", async (event) => { event.preventDefault(); if (finishing || !conference) return; finishing = true; $("#finish-confirm").disabled = true; try { const result = await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/finish`, { method: "POST", body: "{}" }); finishModal.close(); showImportCard(); notify(result.message); $("#new-import-button").focus(); } catch (error) { notify(error instanceof ApiError ? error.message : error.message, "error"); input.focus(); } finally { finishing = false; $("#finish-confirm").disabled = false; } });
+  function queueScan(value) {
+    const caixaEstoque = normalizeCaixaEstoque(value);
+    if (!conference || conference.status !== "EM_ABERTO" || !caixaEstoque) return;
+    scanQueue.push(caixaEstoque);
+    input.value = "";
+    processNextScan();
+  }
+  function scheduleScan() { clearTimeout(scanTimer); const value = normalizeCaixaEstoque(input.value); if (value) scanTimer = setTimeout(() => queueScan(input.value), AUTO_SCAN_DELAY_MS); }
+  cartonForm.addEventListener("submit", (event) => { event.preventDefault(); clearTimeout(scanTimer); queueScan(input.value); }); input.addEventListener("input", scheduleScan); input.addEventListener("paste", () => setTimeout(scheduleScan, 0));
+  $("#extra-list").addEventListener("click", (event) => {
+    const button = event.target.closest(".correct-surplus-button");
+    if (!button || !conference || conference.status !== "EM_ABERTO") return;
+    const eventId = Number(button.dataset.surplusEventId);
+    const selected = (conference.unexpected_cartons || []).find((item) => Number(item.event_id) === eventId);
+    if (!selected) return;
+    clearTimeout(scanTimer);
+    input.value = "";
+    surplusCorrection = { eventId: selected.event_id, code: selected.caixa_estoque };
+    renderSurplusCorrection(conference);
+    input.focus();
+  });
+  $("#cancel-surplus-correction").addEventListener("click", () => {
+    resetSurplusCorrection();
+    input.value = "";
+    input.focus();
+  });
+  const finishModal = $("#finish-modal");
+  function configureFinishModal() {
+    const surplus = Number(conference?.summary?.total_extra || 0);
+    const hasSurplus = surplus > 0;
+    const warning = $("#finish-surplus-warning");
+    const details = $("#finish-surplus-details");
+    finishModal.classList.toggle("finish-modal--surplus", hasSurplus);
+    $("#finish-surplus-icon").hidden = !hasSurplus;
+    $("#finish-title-text").textContent = hasSurplus ? "ATENÇÃO — EXISTEM SOBRAS" : "Finalizar conferência";
+    $("#finish-intro").textContent = hasSurplus ? "" : "Tem certeza de que deseja finalizar esta conferência? Após finalizar, não será possível bipar, cancelar ou alterar os dados.";
+    warning.hidden = !hasSurplus;
+    details.hidden = !hasSurplus;
+    warning.textContent = hasSurplus ? `Foram identificadas ${surplus} sobras nesta conferência. Você já tratou todas as sobras no palete?` : "";
+    $("#finish-surplus-list").replaceChildren(...(conference?.unexpected_cartons || []).map((box) => {
+      const item = document.createElement("li");
+      const code = document.createElement("strong"); code.textContent = normalizeCaixaEstoque(box.caixa_estoque);
+      const order = document.createElement("span"); order.textContent = box.scan_order ? `Leitura #${box.scan_order}` : "SOBRA";
+      const timestamp = document.createElement("time"); timestamp.textContent = box.first_seen_at_local || box.first_seen_at || "Horário não informado";
+      item.replaceChildren(code, order, timestamp); return item;
+    }));
+    $("#finish-cancel").textContent = hasSurplus ? "Voltar para a conferência" : "Voltar";
+    $("#finish-confirm").textContent = hasSurplus ? "Sim, tratei todas as sobras" : "Confirmar finalização";
+  }
+  $("#finish-button").addEventListener("click", () => {
+    if (conference?.status !== "EM_ABERTO") return;
+    configureFinishModal();
+    if (Number(conference.summary?.total_extra || 0) > 0) suppressSurplusAlertForFinish();
+    finishModal.showModal();
+  });
+  $("#finish-cancel").addEventListener("click", () => finishModal.close());
+  finishModal.addEventListener("close", () => {
+    if (!finishing && conference?.status === "EM_ABERTO") {
+      restoreSurplusAlertAfterFinishModal();
+      input.focus();
+    }
+  });
+  $("#finish-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (finishing || !conference) return;
+    const confirmSurpluses = Number(conference.summary?.total_extra || 0) > 0;
+    finishing = true;
+    $("#finish-confirm").disabled = true;
+    try {
+      const result = await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/finish`, { method: "POST", body: JSON.stringify({ confirmar_sobras: confirmSurpluses }) });
+      finishModal.close(); showImportCard();
+      window.dispatchEvent(new Event("sync-state-changed"));
+      notify(result.message);
+      $("#new-import-button").focus();
+    } catch (error) {
+      notify(error instanceof ApiError ? error.message : error.message, "error");
+      if (finishModal.open) finishModal.close();
+      restoreSurplusAlertAfterFinishModal();
+      input.focus();
+    } finally {
+      finishing = false;
+      $("#finish-confirm").disabled = false;
+    }
+  });
   const cancelModal = $("#cancel-conference-modal"); $("#cancel-conference-button").addEventListener("click", () => cancelModal.showModal()); $("#cancel-conference-dismiss").addEventListener("click", () => cancelModal.close()); $("#cancel-conference-form").addEventListener("submit", async (event) => { event.preventDefault(); if (cancelling || !conference) return; cancelling = true; try { const result = await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/cancel`, { method: "POST", body: "{}" }); cancelModal.close(); showImportCard(); notify(result.message, "success"); } catch (error) { notify(error.message, "error"); } finally { cancelling = false; } });
-  $("#sync-pending-button").addEventListener("click", startPendingSynchronization); window.addEventListener("message", handleSyncMessage);
   const reconferenceModal = $("#reconference-modal"); $("#authorize-reconference-button").addEventListener("click", () => { if (conference?.status === "FINALIZADA") reconferenceModal.showModal(); }); $("#reconference-dismiss").addEventListener("click", () => reconferenceModal.close()); $("#reconference-form").addEventListener("submit", async (event) => { event.preventDefault(); const reason = $("#reconference-reason").value.trim(); if (authorizingReconference || reason.length < 10 || !conference) return; authorizingReconference = true; try { const result = await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/reconference`, { method: "POST", body: JSON.stringify({ justificativa: reason }) }); reconferenceModal.close(); $("#reconference-reason").value = ""; render(result); notify(result.message, "success"); } catch (error) { notify(error.message, "error"); } finally { authorizingReconference = false; } });
 }

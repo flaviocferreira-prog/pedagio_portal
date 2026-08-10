@@ -10,8 +10,8 @@ export class ApiError extends Error {
 
 export const routes = Object.freeze({
   activeConference: "/api/conferences/active",
-  pendingSynchronizations: "/api/sincronizacao/pendentes",
-  preparePendingSynchronizations: "/sincronizacao/pendentes/preparar/",
+  syncStatus: "/api/sync/status",
+  syncPending: "/api/sync/pending",
 });
 
 export async function api(url, options = {}) {

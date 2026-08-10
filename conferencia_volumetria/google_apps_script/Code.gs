@@ -1,452 +1,766 @@
-const TIME_ZONE = 'America/Sao_Paulo';
-const CONFERENCES_SHEET = 'CONFERENCIAS';
-const BOXES_SHEET = 'CAIXAS_CONFERENCIA';
-const SCANS_SHEET = 'BIPAGENS';
+/**
+ * PORTAL PEDAGIO - Web App de sincronizacao.
+ *
+ * Script Properties obrigatorias:
+ *   SPREADSHEET_ID
+ *   SYNC_SHARED_SECRET
+ *
+ * O contrato e exclusivamente JSON. O segredo nunca deve ser colocado no
+ * HTML/JavaScript do portal; somente o backend Python envia estas chamadas.
+ */
 
-const CONFERENCE_HEADERS = [
-  'ID_CONFERENCIA', 'ASSINATURA_ARQUIVO', 'PALETE', 'NOME_ARQUIVO',
-  'MATRICULA', 'COLABORADOR', 'TURNO', 'IMPORTADO_EM', 'INICIADO_EM',
-  'FINALIZADO_EM', 'DURACAO_SEGUNDOS', 'TOTAL_ESPERADAS', 'TOTAL_BIPAGENS',
-  'TOTAL_OK', 'TOTAL_FALTAS', 'TOTAL_SOBRAS', 'TOTAL_DUPLICADAS',
-  'STATUS_CONFERENCIA', 'COMPUTADOR', 'STATUS_SINCRONIZACAO', 'SINCRONIZADO_EM'
+var SERVICE_NAME = "apps-script";
+var MAX_BATCH_SIZE = 100;
+var LOCK_TIMEOUT_MS = 5000;
+
+var SHEET_ORDER = [
+  "CONFERENCIAS",
+  "ITENS",
+  "BIPAGENS",
+  "TENTATIVAS",
+  "CONFIRMACOES",
+  "DIVERGENCIAS",
+  "SOBRAS_RESUMO",
+  "SOBRAS",
+  "TRATAMENTOS_SOBRA",
+  "ITENS_TRATAMENTO",
+  "AUDITORIA"
 ];
 
-const BOX_HEADERS = [
-  'ID_ITEM', 'ID_CONFERENCIA', 'SEQUENCIA', 'CODIGO_ORIGINAL',
-  'CODIGO_NORMALIZADO', 'DS_CLASSE', 'STATUS_FINAL', 'BIPADO_EM', 'ORDEM_BIPAGEM'
-];
-
-const SCAN_HEADERS = [
-  'ID_EVENTO', 'ID_CONFERENCIA', 'ORDEM', 'CODIGO_LIDO',
-  'CODIGO_NORMALIZADO', 'RESULTADO', 'BIPADO_EM'
-];
-
-function doGet(event) {
-  try {
-    const properties = PropertiesService.getScriptProperties();
-    const spreadsheetId = properties.getProperty('PLANILHA_ID');
-    const secretConfigured = Boolean(properties.getProperty('SYNC_SECRET'));
-    if (!spreadsheetId || !secretConfigured) {
-      return htmlPage_(
-        'CONFIGURAÇÃO PENDENTE',
-        '<p>Configure PLANILHA_ID e SYNC_SECRET nas propriedades do script.</p>'
-      );
-    }
-    const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
-    return htmlPage_(
-      'INTEGRAÇÃO DISPONÍVEL',
-      '<p>Planilha acessível: <strong>' + escapeHtml_(spreadsheet.getName()) + '</strong>.</p>'
-    );
-  } catch (error) {
-    console.error('Falha no diagnóstico da integração: ' + safeError_(error));
-    return htmlPage_(
-      'INTEGRAÇÃO INDISPONÍVEL',
-      '<p>Não foi possível acessar a planilha configurada.</p>'
-    );
+var SHEET_DEFINITIONS = {
+  CONFERENCIAS: {
+    source: "conference",
+    fields: [
+      "id_conferencia", "local_id", "codigo_palete", "source_filename",
+      "status", "conference_status", "created_at", "started_at",
+      "finished_at", "cancelled_at", "updated_at", "duration_seconds",
+      "productivity_boxes_per_hour", "total_expected", "total_confirmed",
+      "total_missing", "total_scans", "total_duplicates", "total_surpluses",
+      "pending_surpluses", "pallet_class", "final_justification",
+      "source_fingerprint", "content_hash", "import_agenda", "import_origin",
+      "import_operation", "imported_shift", "imported_at", "print_status",
+      "is_reconference", "previous_id_conferencia", "reconference_reason",
+      "reconference_authorized_at", "reconference_authorized_by",
+      "collaborator_registration", "collaborator_name", "collaborator_shift",
+      "started_by", "finished_by", "cancelled_by"
+    ],
+    textFields: [
+      "id_conferencia", "local_id", "codigo_palete", "source_filename",
+      "source_fingerprint", "content_hash", "import_agenda",
+      "previous_id_conferencia", "reconference_authorized_by",
+      "collaborator_registration", "started_by", "finished_by", "cancelled_by"
+    ]
+  },
+  ITENS: {
+    source: "items",
+    fields: [
+      "id_conferencia", "local_id", "caixa_estoque", "ds_classe", "status",
+      "confirmed_at", "confirmed_by", "confirmed_attempt"
+    ],
+    textFields: ["id_conferencia", "local_id", "caixa_estoque", "confirmed_by"]
+  },
+  BIPAGENS: {
+    source: "scans",
+    fields: [
+      "id_conferencia", "local_id", "caixa_estoque", "classification",
+      "scanned_at", "attempt_number", "collaborator_registration",
+      "collaborator_name"
+    ],
+    textFields: [
+      "id_conferencia", "local_id", "caixa_estoque", "collaborator_registration"
+    ]
+  },
+  TENTATIVAS: {
+    source: "attempts",
+    fields: [
+      "id_conferencia", "local_id", "attempt_number", "status", "started_at",
+      "finished_at", "created_at", "started_by", "restarted_by", "finished_by"
+    ],
+    textFields: [
+      "id_conferencia", "local_id", "started_by", "restarted_by", "finished_by"
+    ]
+  },
+  CONFIRMACOES: {
+    source: "confirmations",
+    fields: [
+      "id_conferencia", "local_id", "attempt_number", "item_local_id",
+      "caixa_estoque", "collaborator_registration", "collaborator_name",
+      "confirmed_at"
+    ],
+    textFields: [
+      "id_conferencia", "local_id", "item_local_id", "caixa_estoque",
+      "collaborator_registration"
+    ]
+  },
+  DIVERGENCIAS: {
+    source: "divergences",
+    fields: [
+      "id_conferencia", "local_id", "attempt_number", "divergence_type",
+      "caixa_estoque", "description", "status", "found_at", "found_by",
+      "resolved_at", "resolved_by", "resolution_note"
+    ],
+    textFields: [
+      "id_conferencia", "local_id", "caixa_estoque", "found_by", "resolved_by"
+    ]
+  },
+  SOBRAS_RESUMO: {
+    source: "surplus_summaries",
+    fields: [
+      "id_conferencia", "local_id", "attempt_number", "caixa_estoque",
+      "first_seen_at", "last_seen_at", "attempts", "first_scanned_by"
+    ],
+    textFields: [
+      "id_conferencia", "local_id", "caixa_estoque", "first_scanned_by"
+    ]
+  },
+  SOBRAS: {
+    source: "surpluses",
+    fields: [
+      "id_conferencia", "local_id", "attempt_number", "unexpected_carton_id",
+      "scan_event_id", "caixa_estoque", "scanned_at", "scan_order",
+      "treatment_status", "corrected_by_registration", "corrected_by_name",
+      "corrected_at", "treatment_method"
+    ],
+    textFields: [
+      "id_conferencia", "local_id", "unexpected_carton_id", "scan_event_id",
+      "caixa_estoque", "corrected_by_registration"
+    ]
+  },
+  TRATAMENTOS_SOBRA: {
+    source: "treatments",
+    fields: [
+      "id_conferencia", "local_id", "attempt_number", "collaborator_registration",
+      "collaborator_name", "surplus_count", "confirmed_at",
+      "final_conference_status"
+    ],
+    textFields: ["id_conferencia", "local_id", "collaborator_registration"]
+  },
+  ITENS_TRATAMENTO: {
+    source: "treatment_items",
+    fields: [
+      "id_conferencia", "local_id", "confirmation_id", "unexpected_carton_id",
+      "caixa_estoque", "scanned_at", "scan_order"
+    ],
+    textFields: [
+      "id_conferencia", "local_id", "confirmation_id", "unexpected_carton_id",
+      "caixa_estoque"
+    ]
+  },
+  AUDITORIA: {
+    source: "audit",
+    fields: [
+      "id_conferencia", "local_id", "registration", "profile", "ip_address",
+      "action", "content_hash", "justification", "result", "created_at",
+      "collaborator_name"
+    ],
+    textFields: [
+      "id_conferencia", "local_id", "registration", "ip_address", "content_hash"
+    ]
   }
+};
+
+/**
+ * O health check autenticado tambem usa POST. GET nunca devolve HTML.
+ */
+function doGet() {
+  return jsonResponse_({
+    ok: false,
+    service: SERVICE_NAME,
+    error: {
+      code: "METHOD_NOT_ALLOWED",
+      message: "Utilize uma requisicao POST autenticada."
+    }
+  });
 }
 
 function doPost(event) {
-  let parentOrigin = '';
-  let returnUrl = '';
-  let nonce = '';
-  let conferenceId = '';
-  let attemptId = '';
   try {
-    const parameters = event && event.parameter ? event.parameter : {};
-    if (String(parameters.modo || '') !== 'popup') {
-      throw new Error('GOOGLE_SYNC_FAILED');
+    var request = parseRequest_(event);
+    authenticate_(request);
+    var action = String(request.action || "").trim().toLowerCase();
+    if (action === "health") {
+      return jsonResponse_(handleHealth_());
     }
-    const payloadText = String(parameters.payload || '');
-    const receivedSignature = String(parameters.assinatura || '').trim().toLowerCase();
-    conferenceId = String(parameters.id_conferencia || '');
-    attemptId = String(parameters.attempt_id || '');
-    parentOrigin = validateParentOrigin_(parameters.parent_origin);
-    returnUrl = validateReturnUrl_(parameters.return_url, parentOrigin);
-    nonce = String(parameters.nonce || '');
-    const popupToken = String(parameters.popup_token || '').trim().toLowerCase();
-    if (!payloadText || !receivedSignature || !conferenceId || !parentOrigin || !returnUrl
-        || !/^[A-Za-z0-9_-]{20,200}$/.test(nonce) || !/^[A-Za-z0-9_-]{10,200}$/.test(attemptId) || !popupToken) {
-      throw new Error('GOOGLE_PAYLOAD_INVALID');
+    if (action === "sync") {
+      return jsonResponse_(handleSync_(request));
     }
-
-    const properties = PropertiesService.getScriptProperties();
-    const secret = String(properties.getProperty('SYNC_SECRET') || '');
-    const spreadsheetId = String(properties.getProperty('PLANILHA_ID') || '');
-    if (!secret || !spreadsheetId) {
-      throw new Error('GOOGLE_APPS_SCRIPT_UNAVAILABLE');
-    }
-    const calculatedSignature = hmacHex_(payloadText, secret);
-    if (!constantTimeEquals_(calculatedSignature, receivedSignature)) {
-      throw new Error('GOOGLE_SIGNATURE_INVALID');
-    }
-
-    let payload;
-    try {
-      payload = JSON.parse(payloadText);
-    } catch (error) {
-      throw new Error('GOOGLE_PAYLOAD_INVALID');
-    }
-    validatePayload_(payload);
-    if (String(payload.conferencia.id_conferencia) !== conferenceId) {
-      throw new Error('GOOGLE_CONFERENCE_ID_MISMATCH');
-    }
-    const popupText = 'POPUP|' + conferenceId + '|' + parentOrigin + '|' + returnUrl + '|' + nonce;
-    if (!constantTimeEquals_(hmacHex_(popupText, secret), popupToken)) {
-      throw new Error('GOOGLE_TOKEN_INVALID');
-    }
-    validateCorporateUser_();
-
-    const lock = LockService.getScriptLock();
-    lock.waitLock(30000);
-    try {
-      let result;
-      try {
-        result = performSynchronization_(spreadsheetId, secret, payload);
-      } catch (sheetError) {
-        console.error('Falha ao gravar no Sheets: ' + safeError_(sheetError));
-        throw new Error('GOOGLE_SHEETS_WRITE_FAILED');
-      }
-      return popupRedirectPage_(result, returnUrl, nonce, attemptId);
-    } finally {
-      lock.releaseLock();
-    }
+    throw appError_("INVALID_ACTION", "Acao de integracao invalida.");
   } catch (error) {
-    console.error('Falha na sincronização: ' + safeError_(error));
-    const known = [
-      'GOOGLE_AUTH_REQUIRED', 'GOOGLE_DOMAIN_NOT_ALLOWED', 'GOOGLE_APPS_SCRIPT_UNAVAILABLE',
-      'GOOGLE_PAYLOAD_INVALID', 'GOOGLE_SIGNATURE_INVALID', 'GOOGLE_TOKEN_INVALID',
-      'GOOGLE_CONFERENCE_ID_MISMATCH', 'GOOGLE_SHEETS_WRITE_FAILED', 'SYNC_RECONCILIATION_REQUIRED'
-    ];
-    const errorCode = known.indexOf(safeError_(error)) >= 0 ? safeError_(error) : 'GOOGLE_SYNC_FAILED';
-    return popupErrorPage_(
-      conferenceId, attemptId, parentOrigin, returnUrl, nonce, errorCode,
-      errorCode === 'GOOGLE_AUTH_REQUIRED'
-        ? 'Entre na conta Google corporativa e tente novamente.'
-        : 'O Google Sheets não concluiu a gravação.'
-    );
+    return jsonResponse_(errorResponse_(error));
   }
 }
 
-function validateCorporateUser_() {
-  const email = String(Session.getActiveUser().getEmail() || '').trim().toLowerCase();
-  if (!email) {
-    throw new Error('GOOGLE_AUTH_REQUIRED');
-  }
-  if (!/@fisia\.com\.br$/.test(email)) throw new Error('GOOGLE_DOMAIN_NOT_ALLOWED');
+function handleHealth_() {
+  return withScriptLock_(function() {
+    var spreadsheet = openSpreadsheet_();
+    ensureSheets_(spreadsheet);
+    SpreadsheetApp.flush();
+    return {
+      ok: true,
+      service: SERVICE_NAME,
+      sheets: true,
+      checked_at: new Date().toISOString(),
+      tabs: SHEET_ORDER.slice()
+    };
+  });
 }
 
-function performSynchronization_(spreadsheetId, secret, payload) {
-  const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
-  const conferencesSheet = ensureSheet_(spreadsheet, CONFERENCES_SHEET, CONFERENCE_HEADERS);
-  const boxesSheet = ensureSheet_(spreadsheet, BOXES_SHEET, BOX_HEADERS);
-  const scansSheet = ensureSheet_(spreadsheet, SCANS_SHEET, SCAN_HEADERS);
-  const conference = payload.conferencia;
-  const conferenceId = String(conference.id_conferencia);
-  const existing = findConference_(conferencesSheet, conferenceId);
-  let synchronizedAt;
-  let message;
-  let savedBoxes = 0;
-  let savedScans = 0;
+function handleSync_(request) {
+  var conferences = validateBatchEnvelope_(request.conferences);
+  return withScriptLock_(function() {
+    var spreadsheet = openSpreadsheet_();
+    var sheets = ensureSheets_(spreadsheet);
+    var snapshots = snapshotSheets_(sheets);
+    var resultById = Object.create(null);
+    var pendingWrites = [];
 
-  if (existing) {
-    if (!matchesExistingConference_(conferencesSheet, existing.row, conference)) {
-      throw new Error('SYNC_RECONCILIATION_REQUIRED');
-    }
-    synchronizedAt = existing.synchronizedAt || saoPauloTimestamp_();
-    if (!existing.synchronizedAt) {
-      conferencesSheet.getRange(existing.row, 21).setValue(synchronizedAt);
-    }
-    message = 'A conferência já estava sincronizada.';
-  } else {
-    removeRowsByConference_(boxesSheet, conferenceId, 2);
-    removeRowsByConference_(scansSheet, conferenceId, 2);
-    const boxRows = payload.caixas.map(boxRow_);
-    const scanRows = payload.bipagens.map(scanRow_);
-    appendRows_(boxesSheet, boxRows, [4, 5]);
-    appendRows_(scansSheet, scanRows, [4, 5]);
-    savedBoxes = boxRows.length;
-    savedScans = scanRows.length;
-    synchronizedAt = saoPauloTimestamp_();
-    appendRows_(conferencesSheet, [conferenceRow_(conference, synchronizedAt)], [1, 2, 3, 4, 5]);
-    message = 'Conferência gravada com sucesso.';
-  }
+    conferences.forEach(function(payload) {
+      var conferenceId = String(payload.id_conferencia);
+      try {
+        validateConferencePayload_(payload);
+        var committedState = committedConferenceState_(snapshots, payload);
+        if (committedState === "COMPLETE") {
+          resultById[conferenceId] = {
+            id_conferencia: conferenceId,
+            status: "ALREADY_EXISTS"
+          };
+          return;
+        }
+        if (committedState === "CONFLICT") {
+          throw appError_(
+            "EXISTING_DATA_MISMATCH",
+            "O ID_CONFERENCIA ja existe com outro conteudo."
+          );
+        }
+        pendingWrites.push(payload);
+      } catch (error) {
+        resultById[conferenceId] = {
+          id_conferencia: conferenceId,
+          status: "ERROR",
+          error_code: publicErrorCode_(error)
+        };
+      }
+    });
 
+    if (pendingWrites.length) {
+      try {
+        synchronizeConferences_(sheets, snapshots, pendingWrites);
+        pendingWrites.forEach(function(payload) {
+          var conferenceId = String(payload.id_conferencia);
+          resultById[conferenceId] = {
+            id_conferencia: conferenceId,
+            status: "INSERTED"
+          };
+        });
+      } catch (error) {
+        pendingWrites.forEach(function(payload) {
+          var conferenceId = String(payload.id_conferencia);
+          try {
+            var retrySnapshots = snapshotSheets_(sheets);
+            var retryState = committedConferenceState_(retrySnapshots, payload);
+            if (retryState === "COMPLETE") {
+              resultById[conferenceId] = {
+                id_conferencia: conferenceId,
+                status: "ALREADY_EXISTS"
+              };
+              return;
+            }
+            if (retryState === "CONFLICT") {
+              throw appError_(
+                "EXISTING_DATA_MISMATCH",
+                "O ID_CONFERENCIA ja existe com outro conteudo."
+              );
+            }
+            synchronizeConferences_(sheets, retrySnapshots, [payload]);
+            resultById[conferenceId] = {
+              id_conferencia: conferenceId,
+              status: "INSERTED"
+            };
+          } catch (individualError) {
+            resultById[conferenceId] = {
+              id_conferencia: conferenceId,
+              status: "ERROR",
+              error_code: publicErrorCode_(individualError)
+            };
+          }
+        });
+      }
+    }
+
+    var results = conferences.map(function(payload) {
+      return resultById[String(payload.id_conferencia)];
+    });
+
+    var inserted = countStatus_(results, "INSERTED");
+    var alreadyExists = countStatus_(results, "ALREADY_EXISTS");
+    var errors = results.filter(function(item) {
+      return item.status === "ERROR";
+    }).map(function(item) {
+      return {id_conferencia: item.id_conferencia, code: item.error_code};
+    });
+
+    return {
+      ok: true,
+      service: SERVICE_NAME,
+      sheets: true,
+      received: conferences.length,
+      inserted: inserted,
+      already_exists: alreadyExists,
+      errors: errors,
+      results: results
+    };
+  });
+}
+
+function synchronizeConferences_(sheets, snapshots, payloads) {
+  var conferenceIds = payloads.map(function(payload) {
+    return String(payload.id_conferencia);
+  });
+  removeConferenceRows_(sheets, snapshots, conferenceIds);
+  appendRelationsBatch_(sheets, payloads);
   SpreadsheetApp.flush();
-
-  const receiptText = conferenceId + '|SINCRONIZADO|' + synchronizedAt;
-  const receiptSignature = hmacHex_(receiptText, secret);
-  return {
-    id_conferencia: conferenceId,
-    caixas_salvas: existing ? payload.caixas.length : savedBoxes,
-    bipagens_salvas: existing ? payload.bipagens.length : savedScans,
-    sincronizado_em: synchronizedAt,
-    already_existing: Boolean(existing),
-    message: message,
-    receipt: {
-      id_conferencia: conferenceId,
-      status: 'SINCRONIZADO',
-      sincronizado_em: synchronizedAt,
-      assinatura_recibo: receiptSignature
-    }
-  };
+  appendConferencesBatch_(sheets.CONFERENCIAS, payloads);
+  SpreadsheetApp.flush();
 }
 
-function validatePayload_(payload) {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw new Error('Estrutura do payload inválida.');
-  }
-  if (!payload.conferencia || !Array.isArray(payload.caixas) || !Array.isArray(payload.bipagens)) {
-    throw new Error('Payload incompleto.');
-  }
-  const conference = payload.conferencia;
-  const conferenceId = String(conference.id_conferencia || '');
-  if (!/^[A-Za-z0-9_-]{1,100}$/.test(conferenceId)) {
-    throw new Error('ID da conferência inválido.');
-  }
-  if (conference.status_conferencia !== 'FINALIZADA') {
-    throw new Error('Somente conferências finalizadas podem ser sincronizadas.');
-  }
-  const requiredConferenceFields = [
-    'assinatura_arquivo', 'palete', 'nome_arquivo', 'matricula', 'colaborador',
-    'turno', 'importado_em', 'iniciado_em', 'finalizado_em', 'duracao_segundos',
-    'total_esperadas', 'total_bipagens', 'total_ok', 'total_faltas',
-    'total_sobras', 'total_duplicadas', 'computador'
-  ];
-  requiredConferenceFields.forEach(function(field) {
-    if (!Object.prototype.hasOwnProperty.call(conference, field)) {
-      throw new Error('Campo obrigatório ausente na conferência.');
-    }
+function appendConferencesBatch_(sheet, payloads) {
+  var definition = SHEET_DEFINITIONS.CONFERENCIAS;
+  var rows = payloads.map(function(payload) {
+    return rowValues_(definition, payload.id_conferencia, payload.conference);
   });
-  payload.caixas.forEach(function(box) {
-    if (!box || String(box.id_conferencia || '') !== conferenceId
-        || !box.id_item || !Object.prototype.hasOwnProperty.call(box, 'codigo_original')
-        || !Object.prototype.hasOwnProperty.call(box, 'codigo_normalizado')) {
-      throw new Error('Caixa inválida no payload.');
-    }
-  });
-  payload.bipagens.forEach(function(scan) {
-    if (!scan || String(scan.id_conferencia || '') !== conferenceId
-        || !scan.id_evento || !Object.prototype.hasOwnProperty.call(scan, 'codigo_lido')
-        || !Object.prototype.hasOwnProperty.call(scan, 'codigo_normalizado')) {
-      throw new Error('Bipagem inválida no payload.');
-    }
+  appendRows_(sheet, definition, rows);
+}
+
+function appendRelationsBatch_(sheets, payloads) {
+  SHEET_ORDER.slice(1).forEach(function(sheetName) {
+    var definition = SHEET_DEFINITIONS[sheetName];
+    var rows = [];
+    payloads.forEach(function(payload) {
+      payload[definition.source].forEach(function(item) {
+        rows.push(rowValues_(definition, payload.id_conferencia, item));
+      });
+    });
+    appendRows_(sheets[sheetName], definition, rows);
   });
 }
 
-function conferenceRow_(item, synchronizedAt) {
-  return [
-    String(item.id_conferencia), String(item.assinatura_arquivo), String(item.palete),
-    String(item.nome_arquivo), String(item.matricula), String(item.colaborador),
-    String(item.turno), String(item.importado_em), String(item.iniciado_em),
-    String(item.finalizado_em), number_(item.duracao_segundos), number_(item.total_esperadas),
-    number_(item.total_bipagens), number_(item.total_ok), number_(item.total_faltas),
-    number_(item.total_sobras), number_(item.total_duplicadas),
-    String(item.status_conferencia), String(item.computador), 'SINCRONIZADO', synchronizedAt
-  ];
-}
-
-function boxRow_(item) {
-  return [
-    String(item.id_item), String(item.id_conferencia), number_(item.sequencia),
-    String(item.codigo_original), String(item.codigo_normalizado), String(item.ds_classe || 'NÃO INFORMADO'),
-    String(item.status_final), String(item.bipado_em || ''), number_(item.ordem_bipagem)
-  ];
-}
-
-function scanRow_(item) {
-  return [
-    String(item.id_evento), String(item.id_conferencia), number_(item.ordem),
-    String(item.codigo_lido), String(item.codigo_normalizado),
-    String(item.resultado), String(item.bipado_em || '')
-  ];
-}
-
-function ensureSheet_(spreadsheet, name, headers) {
-  const sheet = spreadsheet.getSheetByName(name) || spreadsheet.insertSheet(name);
-  if (sheet.getLastRow() === 0) {
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    sheet.setFrozenRows(1);
-  } else {
-    const currentHeaders = sheet.getRange(1, 1, 1, headers.length).getDisplayValues()[0];
-    if (currentHeaders.join('\u001f') !== headers.join('\u001f')) {
-      throw new Error('Cabeçalhos incompatíveis na aba ' + name + '.');
-    }
+function appendRows_(sheet, definition, rows) {
+  if (!rows.length) {
+    return;
   }
-  return sheet;
-}
-
-function appendRows_(sheet, rows, textColumns) {
-  if (!rows.length) return;
-  const startRow = sheet.getLastRow() + 1;
-  textColumns.forEach(function(column) {
-    sheet.getRange(startRow, column, rows.length, 1).setNumberFormat('@');
-  });
-  sheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
-}
-
-function findConference_(sheet, conferenceId) {
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return null;
-  const ids = sheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues();
-  for (let index = 0; index < ids.length; index += 1) {
-    if (String(ids[index][0]) === conferenceId) {
-      const row = index + 2;
-      return {
-        row: row,
-        synchronizedAt: String(sheet.getRange(row, 21).getDisplayValue() || '')
-      };
-    }
-  }
-  return null;
-}
-
-function matchesExistingConference_(sheet, row, conference) {
-  const values = sheet.getRange(row, 1, 1, 21).getDisplayValues()[0];
-  return String(values[0]) === String(conference.id_conferencia)
-    && String(values[1]) === String(conference.assinatura_arquivo)
-    && String(values[4]) === String(conference.matricula)
-    && String(values[9]) === String(conference.finalizado_em)
-    && String(values[11]) === String(conference.total_esperadas)
-    && String(values[12]) === String(conference.total_bipagens);
-}
-
-function removeRowsByConference_(sheet, conferenceId, idColumn) {
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return;
-  const ids = sheet.getRange(2, idColumn, lastRow - 1, 1).getDisplayValues();
-  for (let index = ids.length - 1; index >= 0; index -= 1) {
-    if (String(ids[index][0]) === conferenceId) {
-      sheet.deleteRow(index + 2);
-    }
-  }
-}
-
-function hmacHex_(text, secret) {
-  const bytes = Utilities.computeHmacSha256Signature(
-    String(text), String(secret), Utilities.Charset.UTF_8
+  var startRow = Math.max(2, sheet.getLastRow() + 1);
+  ensureGridSize_(
+    sheet,
+    startRow + rows.length - 1,
+    definition.fields.length
   );
-  return bytes.map(function(value) {
-    const unsigned = value < 0 ? value + 256 : value;
-    return ('0' + unsigned.toString(16)).slice(-2);
-  }).join('');
+  var range = sheet.getRange(startRow, 1, rows.length, definition.fields.length);
+  var textRanges = definition.textFields.map(function(field) {
+    var column = definition.fields.indexOf(field) + 1;
+    var columnName = columnName_(column);
+    return columnName + startRow + ":" + columnName + (startRow + rows.length - 1);
+  });
+  if (textRanges.length) {
+    sheet.getRangeList(textRanges).setNumberFormat("@");
+  }
+  range.setValues(rows);
 }
 
-function constantTimeEquals_(first, second) {
-  first = String(first);
-  second = String(second);
-  let difference = first.length ^ second.length;
-  const length = Math.max(first.length, second.length);
-  for (let index = 0; index < length; index += 1) {
-    difference |= (first.charCodeAt(index) || 0) ^ (second.charCodeAt(index) || 0);
+function columnName_(column) {
+  var name = "";
+  var remaining = column;
+  while (remaining > 0) {
+    remaining -= 1;
+    name = String.fromCharCode(65 + (remaining % 26)) + name;
+    remaining = Math.floor(remaining / 26);
+  }
+  return name;
+}
+
+function rowValues_(definition, conferenceId, source) {
+  return definition.fields.map(function(field) {
+    if (field === "id_conferencia") {
+      return safeCellValue_(conferenceId);
+    }
+    return safeCellValue_(source[field]);
+  });
+}
+
+function safeCellValue_(value) {
+  var normalized = cellValue_(value);
+  if (typeof normalized === "string" && /^\s*[=+\-@]/.test(normalized)) {
+    // O apostrofo faz o Sheets manter o conteudo como texto, sem executar
+    // formulas recebidas de arquivos ou campos preenchidos por usuarios.
+    return "'" + normalized;
+  }
+  return normalized;
+}
+
+function cellValue_(value) {
+  if (value === null || typeof value === "undefined") {
+    return "";
+  }
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  throw appError_("INVALID_PAYLOAD", "O lote possui um valor nao escalar.");
+}
+
+function validateBatchEnvelope_(value) {
+  if (!Array.isArray(value)) {
+    throw appError_("INVALID_PAYLOAD", "O campo conferences deve ser uma lista.");
+  }
+  if (value.length > MAX_BATCH_SIZE) {
+    throw appError_("BATCH_TOO_LARGE", "O lote excede o limite permitido.");
+  }
+  var seen = Object.create(null);
+  value.forEach(function(payload) {
+    if (!isPlainObject_(payload)) {
+      throw appError_("INVALID_PAYLOAD", "Conferencia invalida no lote.");
+    }
+    var conferenceId = validateConferenceId_(payload.id_conferencia);
+    if (Object.prototype.hasOwnProperty.call(seen, conferenceId)) {
+      throw appError_("DUPLICATE_CONFERENCE", "O lote repete um ID_CONFERENCIA.");
+    }
+    seen[conferenceId] = true;
+  });
+  return value;
+}
+
+function validateConferencePayload_(payload) {
+  var conferenceId = validateConferenceId_(payload.id_conferencia);
+  if (!isPlainObject_(payload.conference)) {
+    throw appError_("INVALID_PAYLOAD", "Dados da conferencia ausentes.");
+  }
+  validateObjectFields_(payload.conference, SHEET_DEFINITIONS.CONFERENCIAS.fields);
+  if (String(payload.conference.id_conferencia) !== conferenceId) {
+    throw appError_("CONFERENCE_ID_MISMATCH", "ID_CONFERENCIA divergente no payload.");
+  }
+  if (String(payload.conference.conference_status) !== "FINALIZADA") {
+    throw appError_("CONFERENCE_NOT_FINISHED", "Somente conferencias finalizadas podem ser sincronizadas.");
+  }
+
+  SHEET_ORDER.slice(1).forEach(function(sheetName) {
+    var definition = SHEET_DEFINITIONS[sheetName];
+    var rows = payload[definition.source];
+    if (!Array.isArray(rows)) {
+      throw appError_("INVALID_PAYLOAD", "Relacao ausente: " + definition.source + ".");
+    }
+    var seenLocalIds = {};
+    rows.forEach(function(row) {
+      if (!isPlainObject_(row)) {
+        throw appError_("INVALID_PAYLOAD", "Linha relacional invalida.");
+      }
+      validateObjectFields_(row, definition.fields);
+      var localId = String(row.local_id === null || typeof row.local_id === "undefined" ? "" : row.local_id).trim();
+      if (!localId) {
+        throw appError_("INVALID_CHILD_ID", "Registro relacionado sem identificador local.");
+      }
+      var compositeKey = conferenceId + "\u001f" + localId;
+      if (Object.prototype.hasOwnProperty.call(seenLocalIds, compositeKey)) {
+        throw appError_("DUPLICATE_CHILD", "Registro relacionado duplicado no lote.");
+      }
+      seenLocalIds[compositeKey] = true;
+    });
+  });
+}
+
+function validateObjectFields_(object, fields) {
+  fields.forEach(function(field) {
+    if (field === "id_conferencia") {
+      return;
+    }
+    if (!Object.prototype.hasOwnProperty.call(object, field)) {
+      throw appError_("INVALID_PAYLOAD", "Campo obrigatorio ausente: " + field + ".");
+    }
+    cellValue_(object[field]);
+  });
+}
+
+function validateConferenceId_(value) {
+  var conferenceId = String(value === null || typeof value === "undefined" ? "" : value).trim();
+  if (!/^[A-Za-z0-9_-]{1,120}$/.test(conferenceId)) {
+    throw appError_("INVALID_CONFERENCE_ID", "ID_CONFERENCIA invalido.");
+  }
+  return conferenceId;
+}
+
+function ensureSheets_(spreadsheet) {
+  var sheets = {};
+  SHEET_ORDER.forEach(function(sheetName) {
+    var definition = SHEET_DEFINITIONS[sheetName];
+    var sheet = spreadsheet.getSheetByName(sheetName);
+    if (!sheet) {
+      sheet = spreadsheet.insertSheet(sheetName);
+    }
+    ensureHeader_(sheet, definition);
+    sheets[sheetName] = sheet;
+  });
+  return sheets;
+}
+
+function ensureHeader_(sheet, definition) {
+  var expected = definition.fields.map(function(field) {
+    return field.toUpperCase();
+  });
+  if (sheet.getLastRow() === 0) {
+    ensureGridSize_(sheet, 1, expected.length);
+    sheet.getRange(1, 1, 1, expected.length).setValues([expected]);
+    sheet.getRange(1, 1, 1, expected.length).setFontWeight("bold");
+    sheet.setFrozenRows(1);
+    return;
+  }
+  var lastColumn = sheet.getLastColumn();
+  if (lastColumn !== expected.length) {
+    throw appError_("SHEET_SCHEMA_MISMATCH", "Uma aba possui cabecalho incompativel.");
+  }
+  var actual = sheet.getRange(1, 1, 1, expected.length).getDisplayValues()[0];
+  for (var index = 0; index < expected.length; index += 1) {
+    if (String(actual[index]).trim() !== expected[index]) {
+      throw appError_("SHEET_SCHEMA_MISMATCH", "Uma aba possui cabecalho incompativel.");
+    }
+  }
+  sheet.setFrozenRows(1);
+}
+
+function ensureGridSize_(sheet, requiredRows, requiredColumns) {
+  var missingRows = requiredRows - sheet.getMaxRows();
+  if (missingRows > 0) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), missingRows);
+  }
+  var missingColumns = requiredColumns - sheet.getMaxColumns();
+  if (missingColumns > 0) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), missingColumns);
+  }
+}
+
+function snapshotSheets_(sheets) {
+  var snapshots = {};
+  SHEET_ORDER.forEach(function(sheetName) {
+    var sheet = sheets[sheetName];
+    var lastRow = sheet.getLastRow();
+    var rows = lastRow < 2
+      ? []
+      : sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getDisplayValues();
+    var byConference = Object.create(null);
+    rows.forEach(function(values, index) {
+      var conferenceId = String(values[0]);
+      if (!Object.prototype.hasOwnProperty.call(byConference, conferenceId)) {
+        byConference[conferenceId] = [];
+      }
+      byConference[conferenceId].push({row_number: index + 2, values: values});
+    });
+    snapshots[sheetName] = {by_conference: byConference};
+  });
+  return snapshots;
+}
+
+function committedConferenceState_(snapshots, payload) {
+  var conferenceId = String(payload.id_conferencia);
+  var conferenceRows = snapshotRows_(snapshots.CONFERENCIAS, conferenceId);
+  if (!conferenceRows.length) {
+    return "ABSENT";
+  }
+  if (conferenceRows.length !== 1) {
+    return "CONFLICT";
+  }
+
+  var definition = SHEET_DEFINITIONS.CONFERENCIAS;
+  var stored = conferenceRows[0].values;
+  var identityFields = ["local_id", "content_hash", "source_fingerprint"];
+  for (var identityIndex = 0; identityIndex < identityFields.length; identityIndex += 1) {
+    var field = identityFields[identityIndex];
+    var column = definition.fields.indexOf(field);
+    if (column < 0 || String(stored[column]) !== String(cellValue_(payload.conference[field]))) {
+      return "CONFLICT";
+    }
+  }
+
+  for (var sheetIndex = 1; sheetIndex < SHEET_ORDER.length; sheetIndex += 1) {
+    var sheetName = SHEET_ORDER[sheetIndex];
+    var childDefinition = SHEET_DEFINITIONS[sheetName];
+    var existingRows = snapshotRows_(snapshots[sheetName], conferenceId);
+    var existingIds = existingRows.map(function(row) {
+      return String(row.values[1]);
+    }).sort();
+    var expectedIds = payload[childDefinition.source].map(function(row) {
+      return String(row.local_id);
+    }).sort();
+    if (existingIds.length !== expectedIds.length) {
+      return "INCOMPLETE";
+    }
+    for (var rowIndex = 0; rowIndex < expectedIds.length; rowIndex += 1) {
+      if (existingIds[rowIndex] !== expectedIds[rowIndex]) {
+        return "INCOMPLETE";
+      }
+    }
+  }
+  return "COMPLETE";
+}
+
+function snapshotRows_(snapshot, conferenceId) {
+  return snapshot && Object.prototype.hasOwnProperty.call(
+    snapshot.by_conference,
+    conferenceId
+  ) ? snapshot.by_conference[conferenceId] : [];
+}
+
+function removeConferenceRows_(sheets, snapshots, conferenceIds) {
+  SHEET_ORDER.forEach(function(sheetName) {
+    var matchingRows = [];
+    conferenceIds.forEach(function(conferenceId) {
+      snapshotRows_(snapshots[sheetName], conferenceId).forEach(function(row) {
+        matchingRows.push(row.row_number);
+      });
+    });
+    deleteRowsBottomUp_(sheets[sheetName], matchingRows);
+  });
+}
+
+function deleteRowsBottomUp_(sheet, rowNumbers) {
+  var matchingRows = rowNumbers.slice().sort(function(left, right) {
+    return left - right;
+  });
+  if (!matchingRows.length) {
+    return;
+  }
+
+  // Exclui blocos contiguos de baixo para cima para manter os indices estaveis.
+  var blockEnd = matchingRows[matchingRows.length - 1];
+  var blockStart = blockEnd;
+  for (var index = matchingRows.length - 2; index >= -1; index -= 1) {
+    var current = index >= 0 ? matchingRows[index] : null;
+    if (current !== null && current === blockStart - 1) {
+      blockStart = current;
+      continue;
+    }
+    sheet.deleteRows(blockStart, blockEnd - blockStart + 1);
+    if (current !== null) {
+      blockStart = current;
+      blockEnd = current;
+    }
+  }
+}
+
+function openSpreadsheet_() {
+  var spreadsheetId = String(
+    PropertiesService.getScriptProperties().getProperty("SPREADSHEET_ID") || ""
+  ).trim();
+  if (!spreadsheetId) {
+    throw appError_("NOT_CONFIGURED", "A integracao ainda nao foi configurada.");
+  }
+  try {
+    return SpreadsheetApp.openById(spreadsheetId);
+  } catch (error) {
+    throw appError_("SHEETS_UNAVAILABLE", "Nao foi possivel acessar a planilha configurada.");
+  }
+}
+
+function authenticate_(request) {
+  var configured = String(
+    PropertiesService.getScriptProperties().getProperty("SYNC_SHARED_SECRET") || ""
+  );
+  if (!configured) {
+    throw appError_("NOT_CONFIGURED", "A integracao ainda nao foi configurada.");
+  }
+  var received = String(request.shared_secret === null || typeof request.shared_secret === "undefined" ? "" : request.shared_secret);
+  if (!constantTimeEquals_(configured, received)) {
+    throw appError_("UNAUTHORIZED", "Credencial de integracao invalida.");
+  }
+}
+
+function constantTimeEquals_(left, right) {
+  var first = String(left);
+  var second = String(right);
+  var length = Math.max(first.length, second.length);
+  var difference = first.length ^ second.length;
+  for (var index = 0; index < length; index += 1) {
+    var firstCode = index < first.length ? first.charCodeAt(index) : 0;
+    var secondCode = index < second.length ? second.charCodeAt(index) : 0;
+    difference |= firstCode ^ secondCode;
   }
   return difference === 0;
 }
 
-function saoPauloTimestamp_() {
-  return Utilities.formatDate(new Date(), TIME_ZONE, "yyyy-MM-dd'T'HH:mm:ssXXX");
-}
-
-function validateParentOrigin_(value) {
-  const origin = String(value || '').trim();
-  return /^https?:\/\/[A-Za-z0-9.\-\[\]:]+$/.test(origin) ? origin : '';
-}
-
-function validateReturnUrl_(value, parentOrigin) {
-  const returnUrl = String(value || '').trim();
-  return returnUrl === parentOrigin + '/sincronizacao/confirmar/' ? returnUrl : '';
-}
-
-function popupRedirectPage_(result, returnUrl, nonce, attemptId) {
-  const receipt = result.receipt;
-  const fields = {
-    conference_id: receipt.id_conferencia,
-    attempt_id: attemptId,
-    status: 'SUCCESS',
-    sincronizado_em: receipt.sincronizado_em,
-    assinatura_recibo: receipt.assinatura_recibo,
-    ja_sincronizado: result.already_existing ? 'true' : 'false',
-    nonce: nonce
-  };
-  const query = Object.keys(fields).map(function(key) {
-    return encodeURIComponent(key) + '=' + encodeURIComponent(fields[key]);
-  }).join('&');
-  const completeUrl = returnUrl + '?' + query;
-  const safeUrl = JSON.stringify(completeUrl).replace(/</g, '\\u003c');
-  const inputs = Object.keys(fields).map(function(key) {
-    return '<input type="hidden" name="' + escapeHtml_(key) + '" value="'
-      + escapeHtml_(fields[key]) + '">';
-  }).join('');
-  const html = [
-    '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">',
-    '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    '<title>Sincronização concluída</title></head><body>',
-    '<main><h1>Sincronização concluída</h1>',
-    '<p>', escapeHtml_(result.message), '</p>',
-    '<p>Confirmando o recibo no sistema local...</p>',
-    '<form id="local-confirmation" method="get" action="', escapeHtml_(returnUrl), '" target="_top">',
-    inputs, '</form></main>',
-    '<script>(function(){"use strict";',
-    'const url=', safeUrl, ';',
-    'document.getElementById("local-confirmation").submit();',
-    'setTimeout(function(){window.top.location.href=url;},300);',
-    '})();<\/script></body></html>'
-  ].join('');
-  return HtmlService.createHtmlOutput(html).setTitle('Sincronização concluída');
-}
-
-function popupErrorPage_(conferenceId, attemptId, parentOrigin, returnUrl, nonce, code, message) {
-  if (conferenceId && attemptId && parentOrigin && returnUrl && nonce) {
-    return popupResultRedirectPage_({
-      conference_id: conferenceId, attempt_id: attemptId, status: 'ERROR', nonce: nonce,
-      error_code: code, message: message
-    }, returnUrl);
+function withScriptLock_(operation) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    throw appError_("SYNC_BUSY", "Uma sincronizacao ja esta em andamento.");
   }
-  return htmlPage_('SINCRONIZAÇÃO NÃO CONCLUÍDA', '<p>' + escapeHtml_(message) + '</p><script>setTimeout(function(){window.close();},700);</script>');
+  try {
+    return operation();
+  } finally {
+    lock.releaseLock();
+  }
 }
 
-function popupResultRedirectPage_(fields, returnUrl) {
-  const query = Object.keys(fields).map(function(key) {
-    return encodeURIComponent(key) + '=' + encodeURIComponent(String(fields[key] || ''));
-  }).join('&');
-  const completeUrl = returnUrl + '?' + query;
-  const safeUrl = JSON.stringify(completeUrl).replace(/</g, '\\u003c');
-  const inputs = Object.keys(fields).map(function(key) {
-    return '<input type="hidden" name="' + escapeHtml_(key) + '" value="'
-      + escapeHtml_(String(fields[key] || '')) + '">';
-  }).join('');
-  return HtmlService.createHtmlOutput(
-    '<!doctype html><meta charset="utf-8"><main><p>Retornando o resultado ao sistema...</p>'
-    + '<form id="local-result" method="get" action="' + escapeHtml_(returnUrl) + '" target="_top">'
-    + inputs + '</form><script>(function(){document.getElementById("local-result").submit();'
-    + 'setTimeout(function(){window.top.location.href=' + safeUrl + ';},300);})();<\/script></main>'
-  ).setTitle('Resultado da sincronização');
+function parseRequest_(event) {
+  var content = event && event.postData ? event.postData.contents : "";
+  if (!content) {
+    throw appError_("INVALID_JSON", "Corpo JSON ausente.");
+  }
+  var parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    throw appError_("INVALID_JSON", "Corpo JSON invalido.");
+  }
+  if (!isPlainObject_(parsed)) {
+    throw appError_("INVALID_JSON", "O corpo deve ser um objeto JSON.");
+  }
+  return parsed;
 }
 
-function htmlPage_(title, body) {
-  return HtmlService.createHtmlOutput(
-    '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">'
-    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
-    + '<title>' + escapeHtml_(title) + '</title><style>'
-    + 'body{font:16px Arial,sans-serif;background:#f4f6f8;color:#152536;margin:0;padding:32px}'
-    + 'main{max-width:680px;margin:auto;background:#fff;padding:32px;border-radius:12px;box-shadow:0 8px 30px #0002}'
-    + 'h1{font-size:24px}dt{font-weight:700;margin-top:12px}dd{margin:4px 0}'
-    + '.button{display:inline-block;background:#005eb8;color:#fff;text-decoration:none;padding:12px 18px;border-radius:6px;font-weight:700}'
-    + '</style></head><body><main><h1>' + escapeHtml_(title) + '</h1>' + body + '</main></body></html>'
-  ).setTitle(title);
+function isPlainObject_(value) {
+  return value !== null && Object.prototype.toString.call(value) === "[object Object]";
 }
 
-function escapeHtml_(value) {
-  return String(value == null ? '' : value)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+function countStatus_(results, status) {
+  return results.reduce(function(total, item) {
+    return total + (item.status === status ? 1 : 0);
+  }, 0);
 }
 
-function number_(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : 0;
+function appError_(code, message) {
+  var error = new Error(message);
+  error.publicCode = code;
+  return error;
 }
 
-function safeError_(error) {
-  return error && error.message ? String(error.message) : 'Erro não identificado.';
+function publicErrorCode_(error) {
+  return error && error.publicCode ? String(error.publicCode) : "SHEETS_WRITE_FAILED";
+}
+
+function errorResponse_(error) {
+  var code = publicErrorCode_(error);
+  var messages = {
+    INVALID_JSON: "A solicitacao recebida e invalida.",
+    INVALID_ACTION: "A acao solicitada nao e suportada.",
+    INVALID_PAYLOAD: "O lote recebido possui dados invalidos.",
+    INVALID_CONFERENCE_ID: "O lote possui um ID_CONFERENCIA invalido.",
+    DUPLICATE_CONFERENCE: "O lote repete uma conferencia.",
+    BATCH_TOO_LARGE: "O lote excede o limite permitido.",
+    UNAUTHORIZED: "Credencial de integracao invalida.",
+    NOT_CONFIGURED: "A integracao ainda nao foi configurada.",
+    SYNC_BUSY: "Uma sincronizacao ja esta em andamento.",
+    SHEETS_UNAVAILABLE: "Nao foi possivel acessar o Google Sheets.",
+    SHEET_SCHEMA_MISMATCH: "A estrutura das abas e incompativel.",
+    EXISTING_DATA_MISMATCH: "O ID_CONFERENCIA ja existe com outro conteudo.",
+    SHEETS_WRITE_FAILED: "Nao foi possivel concluir a gravacao."
+  };
+  return {
+    ok: false,
+    service: SERVICE_NAME,
+    sheets: false,
+    error: {
+      code: code,
+      message: messages[code] || messages.SHEETS_WRITE_FAILED
+    }
+  };
+}
+
+function jsonResponse_(payload) {
+  return ContentService
+    .createTextOutput(JSON.stringify(payload))
+    .setMimeType(ContentService.MimeType.JSON);
 }

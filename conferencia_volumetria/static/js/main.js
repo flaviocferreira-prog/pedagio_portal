@@ -2,9 +2,11 @@ import { api } from "./api-client.js";
 import { bindUpload } from "./upload.js";
 import { bindConference, loadActiveConference } from "./conference.js";
 import { notify } from "./notifications.js";
+import { bindSync } from "./sync.js";
 
 bindUpload();
 bindConference();
+bindSync();
 
 document.querySelector("#logout-button").addEventListener("click", async () => {
   try {
@@ -16,6 +18,4 @@ document.querySelector("#logout-button").addEventListener("click", async () => {
   }
 });
 
-const initialLoad = loadActiveConference();
-
-initialLoad.catch((error) => notify(error.message, "error"));
+loadActiveConference().catch((error) => notify(error.message, "error"));

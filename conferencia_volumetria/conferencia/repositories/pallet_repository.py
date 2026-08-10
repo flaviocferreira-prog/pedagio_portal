@@ -33,6 +33,19 @@ class PendingConferenceError(Exception):
         self.by_type = by_type or {}
 
 
+class SurplusTreatmentRequiredError(Exception):
+    def __init__(self, surplus_count: int) -> None:
+        super().__init__("SOBRAS_SEM_TRATAMENTO")
+        self.surplus_count = surplus_count
+
+
+class SurplusCorrectionMismatchError(Exception):
+    def __init__(self, expected_code: str, scanned_code: str) -> None:
+        super().__init__("SURPLUS_CORRECTION_MISMATCH")
+        self.expected_code = expected_code
+        self.scanned_code = scanned_code
+
+
 class ActiveConferenceError(Exception):
     def __init__(self, public_id: str) -> None:
         super().__init__(public_id)
@@ -307,6 +320,7 @@ class PalletRepository:
             if attempt is None:
                 scans = []
                 extras = []
+                surplus_events = []
                 counts = {"expected": 0, "confirmed": 0, "extra": 0, "duplicate": 0}
             else:
                 scans = connection.execute(
@@ -323,10 +337,30 @@ class PalletRepository:
                 counts = self._counts(connection, pallet["id"], attempt["id"])
                 extras = connection.execute(
                     """
-                    SELECT code, first_seen_at, last_seen_at, attempts
-                    FROM unexpected_cartons
-                    WHERE attempt_id = ?
-                    ORDER BY id DESC
+                    SELECT id AS event_id, code, scanned_at AS first_seen_at,
+                           scanned_at AS last_seen_at, 1 AS attempts, scan_order,
+                           treatment_status
+                    FROM surplus_events
+                    WHERE attempt_id = ? AND treatment_status = 'PENDENTE'
+                    ORDER BY scan_order ASC, id ASC
+                    """,
+                    (attempt["id"],),
+                ).fetchall()
+                surplus_events = connection.execute(
+                    """
+                    SELECT surplus.id AS event_id, surplus.code, surplus.scanned_at,
+                           surplus.scan_order, surplus.treatment_status,
+                           source.classification AS source_classification,
+                           source.collaborator_registration AS found_by_registration,
+                           finder.nome AS found_by_name,
+                           surplus.corrected_by_registration,
+                           surplus.corrected_by_name, surplus.corrected_at,
+                           surplus.treatment_method
+                    FROM surplus_events surplus
+                    INNER JOIN scan_events source ON source.id = surplus.scan_event_id
+                    LEFT JOIN colaboradores finder ON finder.id = source.collaborator_id
+                    WHERE surplus.attempt_id = ?
+                    ORDER BY surplus.scan_order ASC, surplus.id ASC
                     """,
                     (attempt["id"],),
                 ).fetchall()
@@ -338,6 +372,26 @@ class PalletRepository:
                    WHERE d.pallet_id = ? ORDER BY d.id DESC""",
                 (pallet["id"],),
             ).fetchall()
+            surplus_treatment = connection.execute(
+                """
+                SELECT id, collaborator_registration, collaborator_name, surplus_count,
+                       confirmed_at, final_conference_status
+                FROM surplus_treatment_confirmations
+                WHERE pallet_id = ?
+                """,
+                (pallet["id"],),
+            ).fetchone()
+            surplus_treatment_items = []
+            if surplus_treatment is not None:
+                surplus_treatment_items = connection.execute(
+                    """
+                    SELECT code, scanned_at, scan_order
+                    FROM surplus_treatment_items
+                    WHERE confirmation_id = ?
+                    ORDER BY scan_order ASC, id ASC
+                    """,
+                    (surplus_treatment["id"],),
+                ).fetchall()
             divergence_counts = self._divergence_counts(connection, pallet["id"])
             attempts = connection.execute(
                 """
@@ -401,16 +455,32 @@ class PalletRepository:
             "duration_seconds": pallet["duration_seconds"],
             "productivity_boxes_per_hour": pallet["productivity_boxes_per_hour"],
             "print_status": pallet["print_status"],
-            "synchronization": {
-                "status": pallet["status_sincronizacao"],
-                "started_at": self._format_local_datetime(pallet["sincronizacao_iniciada_em"]),
-                "started_at_iso": pallet["sincronizacao_iniciada_em"],
-                "synchronized_at": self._format_local_datetime(pallet["sincronizado_em"]),
-                "synchronized_at_iso": pallet["sincronizado_em"],
-                "attempts": int(pallet["tentativas_sincronizacao"] or 0),
-                "last_error": pallet["ultimo_erro_sincronizacao"],
-            },
             "final_justification": pallet["final_justification"],
+            "surplus_treatment": {
+                "confirmed": surplus_treatment is not None,
+                "surplus_count": int(surplus_treatment["surplus_count"] or 0)
+                if surplus_treatment is not None else 0,
+                "confirmed_at": self._format_local_datetime(
+                    surplus_treatment["confirmed_at"]
+                ) if surplus_treatment is not None else None,
+                "confirmed_at_iso": surplus_treatment["confirmed_at"]
+                if surplus_treatment is not None else None,
+                "final_conference_status": surplus_treatment["final_conference_status"]
+                if surplus_treatment is not None else None,
+                "collaborator": {
+                    "registration": surplus_treatment["collaborator_registration"],
+                    "name": surplus_treatment["collaborator_name"],
+                } if surplus_treatment is not None else None,
+                "cartons": [
+                    {
+                        "caixa_estoque": normalize_caixa_estoque(row["code"]),
+                        "scanned_at": row["scanned_at"],
+                        "scanned_at_local": self._format_local_datetime(row["scanned_at"]),
+                        "scan_order": int(row["scan_order"]),
+                    }
+                    for row in surplus_treatment_items
+                ],
+            },
             "active_attempt": {
                 "id": attempt["id"] if attempt else None,
                 "number": attempt["attempt_number"] if attempt else 0,
@@ -444,12 +514,41 @@ class PalletRepository:
             ],
             "unexpected_cartons": [
                 {
+                    "event_id": int(row["event_id"]),
                     "caixa_estoque": normalize_caixa_estoque(row["code"]),
                     "first_seen_at": row["first_seen_at"],
+                    "first_seen_at_local": self._format_local_datetime(row["first_seen_at"]),
                     "last_seen_at": row["last_seen_at"],
+                    "last_seen_at_local": self._format_local_datetime(row["last_seen_at"]),
                     "attempts": row["attempts"],
+                    "scan_order": int(row["scan_order"] or 0),
+                    "treatment_status": row["treatment_status"],
                 }
                 for row in extras
+            ],
+            "surplus_events": [
+                {
+                    "event_id": int(row["event_id"]),
+                    "classification": "SOBRA",
+                    "source_classification": row["source_classification"],
+                    "caixa_estoque": normalize_caixa_estoque(row["code"]),
+                    "scanned_at": row["scanned_at"],
+                    "scanned_at_local": self._format_local_datetime(row["scanned_at"]),
+                    "scan_order": int(row["scan_order"]),
+                    "treatment_status": row["treatment_status"],
+                    "found_by": {
+                        "registration": row["found_by_registration"],
+                        "name": row["found_by_name"] or "",
+                    },
+                    "corrected_by": {
+                        "registration": row["corrected_by_registration"],
+                        "name": row["corrected_by_name"],
+                    } if row["corrected_by_registration"] else None,
+                    "corrected_at": row["corrected_at"],
+                    "corrected_at_local": self._format_local_datetime(row["corrected_at"]),
+                    "treatment_method": row["treatment_method"],
+                }
+                for row in surplus_events
             ],
             "divergences": [
                 {
@@ -650,14 +749,14 @@ class PalletRepository:
             else:
                 extra = connection.execute(
                     """
-                    SELECT first_seen_at
+                    SELECT id, first_seen_at
                     FROM unexpected_cartons
                     WHERE attempt_id = ? AND code = ? COLLATE NOCASE
                     """,
                     (attempt["id"], code),
                 ).fetchone()
                 if extra is None:
-                    connection.execute(
+                    inserted_extra = connection.execute(
                         """
                         INSERT INTO unexpected_cartons(
                             pallet_id, attempt_id, code, first_seen_at, last_seen_at,
@@ -667,12 +766,14 @@ class PalletRepository:
                         """,
                         (pallet_id, attempt["id"], code, now, now, collaborator.id),
                     )
+                    unexpected_carton_id = int(inserted_extra.lastrowid)
                     classification = ScanClassification.EXTRA
                     self._record_divergence(
                         connection, pallet_id, attempt["id"], "CAIXA_NAO_ESPERADA", code,
                         "Caixa não esperada para este palete.", collaborator,
                     )
                 else:
+                    unexpected_carton_id = int(extra["id"])
                     connection.execute(
                         """
                         UPDATE unexpected_cartons
@@ -683,7 +784,7 @@ class PalletRepository:
                     )
                     classification = ScanClassification.DUPLICATE_EXTRA
                     first_seen = extra["first_seen_at"]
-            connection.execute(
+            scan_event = connection.execute(
                 """
                 INSERT INTO scan_events(
                     pallet_id, attempt_id, scanned_code, classification,
@@ -701,16 +802,40 @@ class PalletRepository:
                     collaborator.registration,
                 ),
             )
+            if classification in (ScanClassification.EXTRA, ScanClassification.DUPLICATE_EXTRA):
+                connection.execute(
+                    """
+                    INSERT INTO surplus_events(
+                        pallet_id, attempt_id, unexpected_carton_id, scan_event_id,
+                        code, scanned_at, scan_order
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        pallet_id,
+                        attempt["id"],
+                        unexpected_carton_id,
+                        scan_event.lastrowid,
+                        code,
+                        now,
+                        scan_event.lastrowid,
+                    ),
+                )
             connection.execute(
                 "UPDATE pallets SET updated_at = ? WHERE id = ?", (now, pallet_id)
             )
             return classification, first_seen, match_type, (str(expected["code"]) if expected is not None else None)
 
-    def finish(self, pallet_id: int, collaborator: CollaboratorContext) -> None:
+    def finish(
+        self,
+        pallet_id: int,
+        collaborator: CollaboratorContext,
+        *,
+        confirm_surpluses: bool = False,
+    ) -> None:
         pending_error: PendingConferenceError | None = None
         with self.database.connection(immediate=True) as connection:
             pallet = connection.execute(
-                "SELECT conference_status, started_at FROM pallets WHERE id = ?", (pallet_id,)
+                "SELECT conference_status, started_at, content_hash FROM pallets WHERE id = ?", (pallet_id,)
             ).fetchone()
             if pallet is None:
                 raise RepositoryStateError("NOT_FOUND")
@@ -739,6 +864,72 @@ class PalletRepository:
                 pending_error = PendingConferenceError(missing, 0, 0, 0)
             else:
                 now = self._now(connection)
+                surpluses = self._surplus_rows(connection, attempt["id"])
+                if counts["extra"] and not confirm_surpluses:
+                    raise SurplusTreatmentRequiredError(len(surpluses))
+                if counts["extra"]:
+                    confirmation = connection.execute(
+                        """
+                        INSERT INTO surplus_treatment_confirmations(
+                            pallet_id, attempt_id, collaborator_id,
+                            collaborator_registration, collaborator_name,
+                            surplus_count, confirmed_at, final_conference_status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            pallet_id,
+                            attempt["id"],
+                            collaborator.id,
+                            collaborator.registration,
+                            collaborator.name,
+                            len(surpluses),
+                            now,
+                            ConferenceStatus.FINISHED,
+                        ),
+                    )
+                    # M20 is retained for historical compatibility: its unique
+                    # unexpected-carton key represents one aggregate code, while
+                    # surplus_events preserves every occurrence independently.
+                    legacy_surpluses: list[sqlite3.Row] = []
+                    seen_unexpected_ids: set[int] = set()
+                    for surplus in surpluses:
+                        unexpected_id = int(surplus["unexpected_carton_id"])
+                        if unexpected_id not in seen_unexpected_ids:
+                            seen_unexpected_ids.add(unexpected_id)
+                            legacy_surpluses.append(surplus)
+                    connection.executemany(
+                        """
+                        INSERT INTO surplus_treatment_items(
+                            confirmation_id, unexpected_carton_id, code,
+                            scanned_at, scan_order
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (confirmation.lastrowid, row["unexpected_carton_id"], row["code"], row["scanned_at"], row["scan_order"])
+                            for row in legacy_surpluses
+                        ],
+                    )
+                    connection.execute(
+                        """
+                        UPDATE surplus_events
+                        SET treatment_status = 'CORRIGIDA',
+                            corrected_by_collaborator_id = ?,
+                            corrected_by_registration = ?,
+                            corrected_by_name = ?, corrected_at = ?,
+                            treatment_method = 'CONFIRMACAO_FINAL'
+                        WHERE attempt_id = ? AND treatment_status = 'PENDENTE'
+                        """,
+                        (collaborator.id, collaborator.registration, collaborator.name, now, attempt["id"]),
+                    )
+                    self._audit(
+                        connection,
+                        pallet_id,
+                        collaborator,
+                        "SOBRAS_TRATADAS",
+                        pallet["content_hash"],
+                        "CONFIRMADA",
+                        str(len(surpluses)),
+                    )
                 duration = connection.execute(
                     "SELECT MAX(0, CAST((julianday(?) - julianday(?)) * 86400 AS INTEGER)) AS seconds",
                     (now, pallet["started_at"]),
@@ -750,9 +941,7 @@ class PalletRepository:
                     SET status = 'COMPLETED', conference_status = ?, finished_at = ?,
                         duration_seconds = ?, productivity_boxes_per_hour = ?,
                         finished_by_collaborator_id = ?,
-                        final_justification = NULL, status_sincronizacao = 'PENDENTE',
-                        sincronizacao_iniciada_em = NULL, sincronizado_em = NULL,
-                        recibo_sincronizacao = NULL, ultimo_erro_sincronizacao = NULL,
+                        final_justification = NULL,
                         updated_at = ?
                     WHERE id = ? AND conference_status = ?
                     """,
@@ -760,6 +949,27 @@ class PalletRepository:
                 )
                 if updated.rowcount != 1:
                     raise RepositoryStateError("CHANGED")
+                connection.execute(
+                    """
+                    INSERT INTO conference_sync_state(
+                        pallet_id, status, created_at, updated_at
+                    ) VALUES (?, 'PENDENTE', ?, ?)
+                    ON CONFLICT(pallet_id) DO UPDATE SET
+                        status = CASE
+                            WHEN conference_sync_state.status = 'SINCRONIZADA'
+                                THEN 'SINCRONIZADA'
+                            ELSE 'PENDENTE'
+                        END,
+                        reserved_at = NULL,
+                        last_error = CASE
+                            WHEN conference_sync_state.status = 'SINCRONIZADA'
+                                THEN conference_sync_state.last_error
+                            ELSE NULL
+                        END,
+                        updated_at = excluded.updated_at
+                    """,
+                    (pallet_id, now, now),
+                )
                 connection.execute(
                     """
                     UPDATE conference_attempts SET status = 'COMPLETED', finished_at = ?,
@@ -770,6 +980,68 @@ class PalletRepository:
                 )
         if pending_error is not None:
             raise pending_error
+
+    def correct_surplus(
+        self,
+        pallet_id: int,
+        surplus_event_id: int,
+        scanned_code: str,
+        collaborator: CollaboratorContext,
+    ) -> int:
+        """Confirms a selected pending surplus without creating a new scan event."""
+        with self.database.connection(immediate=True) as connection:
+            pallet = connection.execute(
+                "SELECT status, conference_status, started_at, cancelled_at, content_hash FROM pallets WHERE id = ?",
+                (pallet_id,),
+            ).fetchone()
+            if pallet is None:
+                raise RepositoryStateError("NOT_FOUND")
+            if pallet["cancelled_at"] is not None:
+                raise RepositoryStateError("CANCELLED")
+            if pallet["conference_status"] != ConferenceStatus.OPEN:
+                raise RepositoryStateError("FINISHED")
+            if pallet["status"] != "IN_PROGRESS" or pallet["started_at"] is None:
+                raise RepositoryStateError("NOT_STARTED")
+            attempt = self._latest_attempt(connection, pallet_id)
+            if attempt is None or attempt["status"] != "IN_PROGRESS":
+                raise RepositoryStateError("NOT_STARTED")
+            surplus = connection.execute(
+                """
+                SELECT surplus.id, surplus.code, surplus.treatment_status,
+                       source.classification
+                FROM surplus_events surplus
+                INNER JOIN scan_events source ON source.id = surplus.scan_event_id
+                WHERE surplus.id = ? AND surplus.pallet_id = ? AND surplus.attempt_id = ?
+                """,
+                (surplus_event_id, pallet_id, attempt["id"]),
+            ).fetchone()
+            if surplus is None or surplus["classification"] not in ("EXTRA", "DUPLICATE_EXTRA"):
+                raise RepositoryStateError("SURPLUS_NOT_FOUND")
+            if surplus["treatment_status"] != "PENDENTE":
+                raise RepositoryStateError("SURPLUS_ALREADY_CORRECTED")
+            official_code = normalize_caixa_estoque(surplus["code"])
+            scanned = normalize_caixa_estoque(scanned_code)
+            if scanned != official_code:
+                raise SurplusCorrectionMismatchError(official_code, scanned)
+            now = self._now(connection)
+            updated = connection.execute(
+                """
+                UPDATE surplus_events
+                SET treatment_status = 'CORRIGIDA',
+                    corrected_by_collaborator_id = ?, corrected_by_registration = ?,
+                    corrected_by_name = ?, corrected_at = ?, treatment_method = 'REBIPAGEM'
+                WHERE id = ? AND treatment_status = 'PENDENTE'
+                """,
+                (collaborator.id, collaborator.registration, collaborator.name, now, surplus_event_id),
+            )
+            if updated.rowcount != 1:
+                raise RepositoryStateError("SURPLUS_ALREADY_CORRECTED")
+            self._audit(
+                connection, pallet_id, collaborator, "SOBRA_CORRIGIDA",
+                pallet["content_hash"], "REBIPAGEM", str(surplus_event_id),
+            )
+            connection.execute("UPDATE pallets SET updated_at = ? WHERE id = ?", (now, pallet_id))
+            return self._counts(connection, pallet_id, attempt["id"])["extra"]
 
     @staticmethod
     def _record_divergence(
@@ -824,7 +1096,10 @@ class PalletRepository:
             (pallet_id,),
         ).fetchone()
         extra = connection.execute(
-            "SELECT COUNT(*) AS total FROM unexpected_cartons WHERE attempt_id = ?",
+            """
+            SELECT COUNT(*) AS total FROM surplus_events
+            WHERE attempt_id = ? AND treatment_status = 'PENDENTE'
+            """,
             (attempt_id,),
         ).fetchone()["total"]
         duplicate = connection.execute(
@@ -842,6 +1117,20 @@ class PalletRepository:
             "extra": int(extra or 0),
             "duplicate": int(duplicate or 0),
         }
+
+    @staticmethod
+    def _surplus_rows(
+        connection: sqlite3.Connection, attempt_id: int
+    ) -> list[sqlite3.Row]:
+        return connection.execute(
+            """
+            SELECT id, unexpected_carton_id, code, scanned_at, scan_order
+            FROM surplus_events
+            WHERE attempt_id = ? AND treatment_status = 'PENDENTE'
+            ORDER BY scan_order ASC, id ASC
+            """,
+            (attempt_id,),
+        ).fetchall()
 
     @staticmethod
     def _now(connection: sqlite3.Connection) -> str:
@@ -919,5 +1208,6 @@ class PalletRepository:
             "divergences_pending": divergence_counts["pending"],
             "divergences_resolved": divergence_counts["resolved"],
             "pending_divergences_by_type": divergence_counts["by_type"],
+            "requires_surplus_treatment": extra > 0,
             "can_finish": confirmed == expected,
         }

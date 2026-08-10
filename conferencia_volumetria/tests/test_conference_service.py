@@ -25,13 +25,15 @@ from conferencia.repositories.colaborador_repository import ColaboradorRepositor
 from conferencia.repositories.pallet_repository import PalletRepository
 from conferencia.services.acesso_service import AcessoService
 from conferencia.services.automatic_report_service import AutomaticReportService
-from conferencia.services.google_sheets_sync_service import GoogleSheetsSyncService
 from conferencia.services.conference_service import (
     ConflictError,
     InvalidScanError,
     ValidationError,
     ConferenceService,
 )
+from conferencia.sync.client import AppsScriptClient
+from conferencia.sync.repository import SyncRepository
+from conferencia.sync.service import SyncService
 from conferencia.web import ApplicationHandler
 
 
@@ -54,6 +56,25 @@ class ItemReader:
 
     def read_expected_items(self, file_path: Path, extension: str) -> list[dict[str, str]]:
         return self.items
+
+
+class SuccessfulHttpSyncClient:
+    configured = True
+
+    def __init__(self) -> None:
+        self.health_calls = 0
+        self.batches: list[list[dict[str, object]]] = []
+
+    def health_check(self) -> dict[str, object]:
+        self.health_calls += 1
+        return {"ok": True, "service": "apps-script", "sheets": True}
+
+    def send_batch(self, payloads: list[dict[str, object]]) -> list[dict[str, object]]:
+        self.batches.append(payloads)
+        return [
+            {"id_conferencia": payload["id_conferencia"], "status": "INSERTED"}
+            for payload in payloads
+        ]
 
 
 def minimal_xlsx(codes: list[str], *, numeric: bool = False) -> bytes:
@@ -321,7 +342,7 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertEqual(2, sum(result.startswith("CONF-") for result in results))
         self.assertTrue(self.service.active_pallet(self.actor)["has_active_conference"])
 
-    def test_expected_duplicate_and_divergent_results(self) -> None:
+    def test_expected_duplicate_and_surplus_results(self) -> None:
         self.start()
         matched = self.service.scan_carton(self.public_id, "  000001\r\n", self.actor)
         duplicate = self.service.scan_carton(self.public_id, "000001", self.actor)
@@ -331,11 +352,11 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertEqual(("CONFERIDA", "Caixa conferida com sucesso."), (matched["result"], matched["message"]))
         self.assertEqual(("EXACT", "000001", "000001"), (matched["match_type"], matched["scanned_code"], matched["expected_code"]))
         self.assertEqual(("DUPLICADA", "Caixa já conferida."), (duplicate["result"], duplicate["message"]))
-        self.assertEqual("DIVERGENTE", divergent["result"])
+        self.assertEqual("SOBRA", divergent["result"])
         self.assertIn("código não esperado", divergent["message"])
         self.assertEqual("DUPLICADA", repeated_extra["result"])
         self.assertEqual(1, repeated_extra["summary"]["total_confirmed"])
-        self.assertEqual(1, repeated_extra["summary"]["total_extra"])
+        self.assertEqual(2, repeated_extra["summary"]["total_extra"])
         self.assertEqual(2, repeated_extra["summary"]["total_duplicate_reads"])
 
     def test_scan_matches_variable_leading_zero_counts_without_changing_stored_code(self) -> None:
@@ -368,7 +389,7 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertEqual(0, state["summary"]["total_confirmed"])
         self.assertEqual(0, state["summary"]["total_extra"])
 
-    def test_divergences_are_display_only_and_do_not_block_finish(self) -> None:
+    def test_surplus_requires_auditable_treatment_before_finish(self) -> None:
         self.start()
         for code in ("000001", "CX-002", "CX-003"):
             self.service.scan_carton(self.public_id, code, self.actor)
@@ -376,8 +397,146 @@ class ConferenceServiceTests(unittest.TestCase):
         state = self.service.scan_carton(self.public_id, "CX-003", self.actor)
         self.assertEqual(100.0, state["summary"]["coverage_percent"])
         self.assertTrue(state["summary"]["can_finish"])
-        finished = self.service.finish_pallet(self.public_id, self.actor)
+        with self.assertRaises(ConflictError) as raised:
+            self.service.finish_pallet(self.public_id, self.actor)
+        self.assertEqual("SOBRAS_SEM_TRATAMENTO", raised.exception.code)
+        self.assertEqual(1, raised.exception.details["sobras"])
+        finished = self.service.finish_pallet(
+            self.public_id, self.actor, confirm_surpluses=True
+        )
         self.assertEqual("FINALIZADA", finished["status"])
+        treatment = finished["surplus_treatment"]
+        self.assertTrue(treatment["confirmed"])
+        self.assertEqual(1, treatment["surplus_count"])
+        self.assertEqual(self.actor.registration, treatment["collaborator"]["registration"])
+        self.assertRegex(treatment["confirmed_at"], r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$")
+        with self.database.connection() as connection:
+            recorded = connection.execute(
+                "SELECT surplus_count, collaborator_registration FROM surplus_treatment_confirmations"
+            ).fetchone()
+        self.assertEqual((1, self.actor.registration), tuple(recorded))
+
+    def test_surplus_treatment_preserves_codes_times_order_and_final_status(self) -> None:
+        self.start()
+        self.service.scan_carton(self.public_id, "000001", self.actor)
+        first_surplus = "00009999990462163048"
+        second_surplus = "00000000000000000007"
+        self.service.scan_carton(self.public_id, first_surplus, self.actor)
+        self.service.scan_carton(self.public_id, "CX-002", self.actor)
+        state = self.service.scan_carton(self.public_id, second_surplus, self.actor)
+        self.service.scan_carton(self.public_id, "CX-003", self.actor)
+
+        self.assertEqual(2, state["summary"]["total_extra"])
+        self.assertEqual(
+            [first_surplus, second_surplus],
+            [item["caixa_estoque"] for item in state["unexpected_cartons"]],
+        )
+        self.assertEqual(
+            sorted(item["scan_order"] for item in state["unexpected_cartons"]),
+            [item["scan_order"] for item in state["unexpected_cartons"]],
+        )
+        self.assertTrue(all(item["scan_order"] > 0 for item in state["unexpected_cartons"]))
+        self.assertTrue(
+            all(
+                item["first_seen_at_local"]
+                and item["first_seen_at_local"].count(":") == 2
+                for item in state["unexpected_cartons"]
+            )
+        )
+
+        finished = self.service.finish_pallet(
+            self.public_id, self.actor, confirm_surpluses=True
+        )
+        treatment = finished["surplus_treatment"]
+        self.assertTrue(treatment["confirmed"])
+        self.assertEqual("FINALIZADA", treatment["final_conference_status"])
+        self.assertEqual(
+            [first_surplus, second_surplus],
+            [item["caixa_estoque"] for item in treatment["cartons"]],
+        )
+        self.assertEqual(
+            sorted(item["scan_order"] for item in treatment["cartons"]),
+            [item["scan_order"] for item in treatment["cartons"]],
+        )
+        self.assertTrue(
+            all(item["scanned_at_local"] for item in treatment["cartons"])
+        )
+        with self.database.connection() as connection:
+            persisted = connection.execute(
+                """
+                SELECT code, scan_order
+                FROM surplus_treatment_items
+                ORDER BY scan_order
+                """
+            ).fetchall()
+        self.assertEqual(
+            [(first_surplus, persisted[0]["scan_order"]), (second_surplus, persisted[1]["scan_order"])],
+            [(row["code"], row["scan_order"]) for row in persisted],
+        )
+
+    def test_failed_finish_with_surplus_keeps_conference_open_without_partial_treatment(self) -> None:
+        self.start()
+        surplus = "00009999990462163048"
+        self.service.scan_carton(self.public_id, surplus, self.actor)
+
+        with self.assertRaises(ConflictError) as raised:
+            self.service.finish_pallet(
+                self.public_id, self.actor, confirm_surpluses=True
+            )
+
+        self.assertEqual("CONFERENCIA_COM_PENDENCIAS", raised.exception.code)
+        open_state = self.service.get_pallet(self.public_id)
+        self.assertEqual("EM_ABERTO", open_state["status"])
+        self.assertFalse(open_state["surplus_treatment"]["confirmed"])
+        self.assertEqual([surplus], [item["caixa_estoque"] for item in open_state["unexpected_cartons"]])
+        with self.database.connection() as connection:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM surplus_treatment_confirmations"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM surplus_treatment_items"
+                ).fetchone()[0],
+            )
+
+    def test_repeated_confirmed_finish_is_idempotent_for_surplus_treatment(self) -> None:
+        self.start()
+        for code in ("000001", "CX-002", "CX-003", "FORA"):
+            self.service.scan_carton(self.public_id, code, self.actor)
+
+        self.service.finish_pallet(self.public_id, self.actor, confirm_surpluses=True)
+        repeated = self.service.finish_pallet(
+            self.public_id, self.actor, confirm_surpluses=True
+        )
+
+        self.assertEqual("FINALIZADA", repeated["status"])
+        with self.database.connection() as connection:
+            self.assertEqual(
+                1,
+                connection.execute(
+                    "SELECT COUNT(*) FROM surplus_treatment_confirmations"
+                ).fetchone()[0],
+            )
+
+    def test_active_conference_restores_the_official_surplus_state(self) -> None:
+        self.start()
+        surplus = "00009999990462163048"
+        self.service.scan_carton(self.public_id, surplus, self.actor)
+
+        restored = PalletRepository(SQLiteDatabase(self.database.database_path)).details(
+            self.public_id
+        )
+
+        self.assertEqual("EM_ABERTO", restored["status"])
+        self.assertEqual(1, restored["summary"]["total_extra"])
+        self.assertEqual(
+            [surplus],
+            [item["caixa_estoque"] for item in restored["unexpected_cartons"]],
+        )
 
     def test_empty_scan_does_not_create_event(self) -> None:
         self.start()
@@ -419,11 +578,19 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertEqual("EM_ABERTO", awaiting["workflow_status"])
         self.assertIsNone(awaiting["finished_at"])
         extra = self.service.scan_carton(self.public_id, "FORA", self.actor)
-        self.assertEqual("DIVERGENTE", extra["result"])
+        self.assertEqual("SOBRA", extra["result"])
         self.assertEqual("EM_ABERTO", extra["status"])
         self.assertEqual("EM_ABERTO", extra["workflow_status"])
         self.assertEqual(1, extra["summary"]["total_extra"])
-        self.assertEqual("FINALIZADA", self.service.finish_pallet(self.public_id, self.actor)["status"])
+        with self.assertRaises(ConflictError) as raised:
+            self.service.finish_pallet(self.public_id, self.actor)
+        self.assertEqual("SOBRAS_SEM_TRATAMENTO", raised.exception.code)
+        self.assertEqual(
+            "FINALIZADA",
+            self.service.finish_pallet(
+                self.public_id, self.actor, confirm_surpluses=True
+            )["status"],
+        )
 
     def test_duplicate_scan_does_not_block_finish_at_full_coverage(self) -> None:
         self.start()
@@ -561,7 +728,7 @@ class ConferenceServiceTests(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-        self.assertEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18], versions)
+        self.assertEqual(list(range(1, 23)), versions)
         with self.assertRaises(ValidationError):
             self.service.import_pallet(
                 ConferenceImport(
@@ -573,6 +740,147 @@ class ConferenceServiceTests(unittest.TestCase):
                     agenda="AGENDA TESTE",
                 )
             )
+
+    def test_surplus_treatment_migrations_preserve_existing_conference_data(self) -> None:
+        self.start()
+        self.service.scan_carton(self.public_id, "000001", self.actor)
+        with self.database.connection(immediate=True) as connection:
+            connection.execute("DROP TABLE surplus_treatment_items")
+            connection.execute("DROP TABLE surplus_treatment_confirmations")
+            connection.execute("DELETE FROM schema_migrations WHERE version IN (19, 20)")
+        SQLiteDatabase(self.database.database_path).initialize()
+        restored = PalletRepository(SQLiteDatabase(self.database.database_path)).details(
+            self.public_id
+        )
+        self.assertEqual(1, restored["summary"]["total_confirmed"])
+        with self.database.connection() as connection:
+            versions = [
+                row["version"]
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations WHERE version IN (19, 20) ORDER BY version"
+                )
+            ]
+            table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'surplus_treatment_confirmations'"
+            ).fetchone()["name"]
+            items_table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'surplus_treatment_items'"
+            ).fetchone()["name"]
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(surplus_treatment_confirmations)"
+                )
+            }
+        self.assertEqual([19, 20], versions)
+        self.assertEqual("surplus_treatment_confirmations", table)
+        self.assertEqual("surplus_treatment_items", items_table)
+        self.assertIn("final_conference_status", columns)
+
+    def test_migration_020_backfills_existing_surplus_treatment_items(self) -> None:
+        self.start()
+        for code in ("000001", "CX-002", "CX-003", "00009999990462163048"):
+            self.service.scan_carton(self.public_id, code, self.actor)
+        self.service.finish_pallet(self.public_id, self.actor, confirm_surpluses=True)
+        with self.database.connection(immediate=True) as connection:
+            connection.execute("DROP TABLE surplus_treatment_items")
+            connection.execute("DELETE FROM schema_migrations WHERE version = 20")
+
+        SQLiteDatabase(self.database.database_path).initialize()
+
+        restored = PalletRepository(SQLiteDatabase(self.database.database_path)).details(
+            self.public_id
+        )
+        self.assertEqual(
+            ["00009999990462163048"],
+            [item["caixa_estoque"] for item in restored["surplus_treatment"]["cartons"]],
+        )
+
+
+    def test_rebipagem_corrects_one_pending_surplus_without_new_scan_event(self) -> None:
+        self.start()
+        code = "00009999990462163048"
+        self.service.scan_carton(self.public_id, code, self.actor)
+        second = self.service.scan_carton(self.public_id, code, self.actor)
+        pending_events = second["unexpected_cartons"]
+        self.assertEqual(2, second["summary"]["total_extra"])
+        self.assertEqual(2, len(pending_events))
+        self.assertNotEqual(pending_events[0]["event_id"], pending_events[1]["event_id"])
+        with self.database.connection() as connection:
+            scans_before = connection.execute("SELECT COUNT(*) FROM scan_events").fetchone()[0]
+
+        with self.assertRaises(ConflictError) as incorrect:
+            self.service.correct_surplus(
+                self.public_id, pending_events[0]["event_id"], "9999999999", self.actor
+            )
+        self.assertEqual("CODIGO_CORRECAO_INCORRETO", incorrect.exception.code)
+        self.assertEqual(code, incorrect.exception.details["expected_code"])
+        self.assertEqual("9999999999", incorrect.exception.details["scanned_code"])
+        with self.database.connection() as connection:
+            self.assertEqual(scans_before, connection.execute("SELECT COUNT(*) FROM scan_events").fetchone()[0])
+
+        corrected = self.service.correct_surplus(
+            self.public_id, pending_events[0]["event_id"], code, self.actor
+        )
+        self.assertEqual(1, corrected["summary"]["total_extra"])
+        self.assertEqual([pending_events[1]["event_id"]], [item["event_id"] for item in corrected["unexpected_cartons"]])
+        audit_event = next(item for item in corrected["surplus_events"] if item["event_id"] == pending_events[0]["event_id"])
+        self.assertEqual("SOBRA", audit_event["classification"])
+        self.assertEqual("CORRIGIDA", audit_event["treatment_status"])
+        self.assertEqual("REBIPAGEM", audit_event["treatment_method"])
+        self.assertEqual(self.actor.registration, audit_event["corrected_by"]["registration"])
+        self.assertRegex(audit_event["corrected_at_local"], r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$")
+        with self.assertRaises(ConflictError) as repeated:
+            self.service.correct_surplus(self.public_id, pending_events[0]["event_id"], code, self.actor)
+        self.assertEqual("SOBRA_JA_CORRIGIDA", repeated.exception.code)
+
+        remaining = self.service.correct_surplus(
+            self.public_id, pending_events[1]["event_id"], code, self.actor
+        )
+        self.assertEqual(0, remaining["summary"]["total_extra"])
+        self.assertEqual([], remaining["unexpected_cartons"])
+
+    def test_finish_after_all_rebipagem_needs_no_final_surplus_confirmation(self) -> None:
+        self.start()
+        for code in ("000001", "CX-002", "CX-003"):
+            self.service.scan_carton(self.public_id, code, self.actor)
+        surplus = self.service.scan_carton(self.public_id, "00000042", self.actor)["unexpected_cartons"][0]
+        corrected = self.service.correct_surplus(
+            self.public_id, surplus["event_id"], "00000042", self.actor
+        )
+        self.assertFalse(corrected["surplus_treatment"]["confirmed"])
+        finished = self.service.finish_pallet(self.public_id, self.actor)
+        self.assertEqual("FINALIZADA", finished["status"])
+        self.assertFalse(finished["surplus_treatment"]["confirmed"])
+        self.assertEqual("REBIPAGEM", finished["surplus_events"][0]["treatment_method"])
+
+    def test_migration_021_backfills_pending_surplus_events_without_recreating_conference(self) -> None:
+        self.start()
+        self.service.scan_carton(self.public_id, "000045", self.actor)
+        with self.database.connection(immediate=True) as connection:
+            connection.execute("DROP TABLE surplus_events")
+            connection.execute("DELETE FROM schema_migrations WHERE version = 21")
+        SQLiteDatabase(self.database.database_path).initialize()
+        restored = PalletRepository(SQLiteDatabase(self.database.database_path)).details(self.public_id)
+        self.assertEqual("EM_ABERTO", restored["status"])
+        self.assertEqual(1, restored["summary"]["total_extra"])
+        self.assertEqual("PENDENTE", restored["surplus_events"][0]["treatment_status"])
+        self.assertEqual("000045", restored["surplus_events"][0]["caixa_estoque"])
+
+    def test_migration_021_marks_legacy_final_confirmation_without_inventing_rebipagem(self) -> None:
+        self.start()
+        for code in ("000001", "CX-002", "CX-003", "000077"):
+            self.service.scan_carton(self.public_id, code, self.actor)
+        self.service.finish_pallet(self.public_id, self.actor, confirm_surpluses=True)
+        with self.database.connection(immediate=True) as connection:
+            connection.execute("DROP TABLE surplus_events")
+            connection.execute("DELETE FROM schema_migrations WHERE version = 21")
+        SQLiteDatabase(self.database.database_path).initialize()
+        restored = PalletRepository(SQLiteDatabase(self.database.database_path)).details(self.public_id)
+        event = restored["surplus_events"][0]
+        self.assertEqual("CORRIGIDA", event["treatment_status"])
+        self.assertEqual("CONFIRMACAO_FINAL", event["treatment_method"])
+        self.assertEqual(self.actor.registration, event["corrected_by"]["registration"])
 
 
 class ReaderTests(unittest.TestCase):
@@ -687,10 +995,15 @@ class OfficialHttpFlowTests(unittest.TestCase):
         TestHandler.controller = ConferenceController(service)
         TestHandler.acesso_service = AcessoService(self.collaborators, settings)
         TestHandler.sessions = SessionManager()
+        self.sync_service = SyncService(
+            SyncRepository(self.database),
+            AppsScriptClient("", ""),
+            sleeper=lambda _seconds: None,
+        )
+        TestHandler.sync_service = self.sync_service
         self.downloads = Path(self.tempdir.name) / "Downloads"
         self.downloads.mkdir()
         TestHandler.automatic_report_service = AutomaticReportService(settings.max_upload_bytes, (self.downloads,))
-        TestHandler.google_sync_service = GoogleSheetsSyncService(self.database, settings)
 
         from http.server import ThreadingHTTPServer
 
@@ -761,10 +1074,12 @@ class OfficialHttpFlowTests(unittest.TestCase):
         self.assertEqual(401, status)
         self.assertEqual("COLABORADOR_NAO_IDENTIFICADO", body["error"]["code"])
         self.assertEqual("/", body["error"]["details"]["redirect_url"])
+        self.assertEqual(401, self.client.request("GET", "/api/sync/status")[0])
+        self.assertEqual(401, self.client.request("POST", "/api/sync/pending")[0])
         forbidden_message = "Matrícula é " + "obrigatória"
         self.assertNotIn(forbidden_message, json.dumps(body, ensure_ascii=False))
 
-    def test_finish_has_no_follow_up_404_and_returns_explicit_inactive_state(self) -> None:
+    def test_finish_is_local_and_returns_explicit_inactive_state(self) -> None:
         self.client.request("POST", "/api/access", {"matricula": "001234"})
         uploaded_status, uploaded, _ = self.client.request(
             "POST", "/api/conferences",
@@ -777,16 +1092,138 @@ class OfficialHttpFlowTests(unittest.TestCase):
 
         finished_status, finished, _ = self.client.request("POST", f"/api/conferences/{public_id}/finish")
         active_status, active, _ = self.client.request("GET", "/api/conferences/active")
-        pending_status, pending, _ = self.client.request("GET", "/api/sincronizacao/pendentes")
 
         self.assertEqual(200, finished_status)
         self.assertEqual("FINALIZADA", finished["data"]["status"])
-        self.assertEqual("PENDENTE", finished["data"]["synchronization"]["status"])
+        self.assertNotIn("synchron" + "ization", finished["data"])
         self.assertEqual(200, active_status)
         self.assertFalse(active["data"]["has_active_conference"])
         self.assertIsNone(active["data"]["conference"])
-        self.assertEqual(200, pending_status)
-        self.assertEqual(1, pending["data"]["pending"])
+        with self.database.connection() as connection:
+            sync_state = connection.execute(
+                """
+                SELECT state.status
+                FROM conference_sync_state state
+                INNER JOIN pallets pallet ON pallet.id = state.pallet_id
+                WHERE pallet.public_id = ?
+                """,
+                (public_id,),
+            ).fetchone()
+        self.assertEqual("PENDENTE", sync_state["status"])
+        sync_status, sync_body, _ = self.client.request("GET", "/api/sync/status")
+        self.assertEqual(200, sync_status)
+        self.assertEqual(1, sync_body["data"]["pending"])
+        self.assertFalse(sync_body["data"]["configured"])
+        manual_status, manual_body, _ = self.client.request("POST", "/api/sync/pending")
+        self.assertEqual(200, manual_status)
+        self.assertEqual(1, manual_body["data"]["failed"])
+        self.assertFalse(manual_body["data"]["configured"])
+        legacy_root = "/" + "sincron" + "izacao"
+        self.assertEqual(404, self.client.request("GET", f"/api{legacy_root}/pendentes")[0])
+        self.assertEqual(404, self.client.request("POST", f"{legacy_root}/pendentes/preparar/", {})[0])
+
+    def test_manual_sync_endpoint_processes_the_real_local_queue(self) -> None:
+        self.client.request("POST", "/api/access", {"matricula": "001234"})
+        uploaded_status, uploaded, _ = self.client.request(
+            "POST",
+            "/api/conferences",
+            {
+                "filename": "sincronizar.csv",
+                "content_base64": b64encode(b"CAIXA_ESTOQUE\n0001\n").decode(),
+            },
+        )
+        self.assertEqual(201, uploaded_status)
+        public_id = uploaded["data"]["public_id"]
+        self.assertEqual(200, self.client.request("POST", f"/api/conferences/{public_id}/start")[0])
+        self.assertEqual(
+            200,
+            self.client.request(
+                "POST",
+                f"/api/conferences/{public_id}/scan",
+                {"caixa_estoque": "0001"},
+            )[0],
+        )
+        self.assertEqual(200, self.client.request("POST", f"/api/conferences/{public_id}/finish")[0])
+
+        client = SuccessfulHttpSyncClient()
+        self.sync_service.client = client
+        status, body, _ = self.client.request("POST", "/api/sync/pending")
+
+        self.assertEqual(200, status)
+        self.assertEqual(1, body["data"]["found"])
+        self.assertEqual(1, body["data"]["synchronized"])
+        self.assertEqual(0, body["data"]["failed"])
+        self.assertEqual(1, client.health_calls)
+        self.assertEqual(1, len(client.batches))
+        self.assertEqual(public_id, client.batches[0][0]["id_conferencia"])
+        self.assertEqual("0001", client.batches[0][0]["items"][0]["caixa_estoque"])
+        status_code, status_body, _ = self.client.request("GET", "/api/sync/status")
+        self.assertEqual(200, status_code)
+        self.assertEqual(0, status_body["data"]["pending"])
+        self.assertEqual(1, status_body["data"]["synchronized"])
+
+    def test_finish_api_requires_explicit_boolean_surplus_confirmation(self) -> None:
+        self.client.request("POST", "/api/access", {"matricula": "001234"})
+        uploaded_status, uploaded, _ = self.client.request(
+            "POST", "/api/conferences",
+            {
+                "filename": "sobras.csv",
+                "content_base64": b64encode(b"CAIXA_ESTOQUE\n0001\n").decode(),
+            },
+        )
+        self.assertEqual(201, uploaded_status)
+        public_id = uploaded["data"]["public_id"]
+        self.assertEqual(200, self.client.request("POST", f"/api/conferences/{public_id}/start")[0])
+        self.assertEqual(200, self.client.request("POST", f"/api/conferences/{public_id}/scan", {"caixa_estoque": "0001"})[0])
+        extra_status, extra, _ = self.client.request(
+            "POST", f"/api/conferences/{public_id}/scan", {"caixa_estoque": "FORA"}
+        )
+        self.assertEqual("SOBRA", extra["data"]["result"])
+
+        blocked_status, blocked, _ = self.client.request(
+            "POST", f"/api/conferences/{public_id}/finish", {"confirmar_sobras": "true"}
+        )
+        self.assertEqual(409, blocked_status)
+        self.assertEqual("SOBRAS_SEM_TRATAMENTO", blocked["error"]["code"])
+
+        finished_status, finished, _ = self.client.request(
+            "POST", f"/api/conferences/{public_id}/finish", {"confirmar_sobras": True}
+        )
+        self.assertEqual(200, finished_status)
+        self.assertTrue(finished["data"]["surplus_treatment"]["confirmed"])
+
+    def test_http_rebipagem_requires_selected_event_and_preserves_pending_on_error(self) -> None:
+        self.client.request("POST", "/api/access", {"matricula": "001234"})
+        uploaded_status, uploaded, _ = self.client.request(
+            "POST", "/api/conferences",
+            {"filename": "rebipagem.csv", "content_base64": b64encode(b"CAIXA_ESTOQUE\n0001\n").decode()},
+        )
+        self.assertEqual(201, uploaded_status)
+        public_id = uploaded["data"]["public_id"]
+        self.assertEqual(200, self.client.request("POST", f"/api/conferences/{public_id}/start")[0])
+        self.assertEqual(200, self.client.request("POST", f"/api/conferences/{public_id}/scan", {"caixa_estoque": "0001"})[0])
+        _, extra, _ = self.client.request(
+            "POST", f"/api/conferences/{public_id}/scan", {"caixa_estoque": "00000042"}
+        )
+        event_id = extra["data"]["unexpected_cartons"][0]["event_id"]
+
+        wrong_status, wrong, _ = self.client.request(
+            "POST", f"/api/conferences/{public_id}/correct-surplus",
+            {"surplus_event_id": event_id, "caixa_estoque": "42", "nome": "NAO CONFIAR"},
+        )
+        self.assertEqual(409, wrong_status)
+        self.assertEqual("CODIGO_CORRECAO_INCORRETO", wrong["error"]["code"])
+        self.assertEqual("00000042", wrong["error"]["details"]["expected_code"])
+        self.assertEqual("42", wrong["error"]["details"]["scanned_code"])
+
+        corrected_status, corrected, _ = self.client.request(
+            "POST", f"/api/conferences/{public_id}/correct-surplus",
+            {"surplus_event_id": event_id, "caixa_estoque": "00000042", "matricula": "999999"},
+        )
+        self.assertEqual(200, corrected_status)
+        self.assertEqual(0, corrected["data"]["pending_surpluses"])
+        self.assertEqual([], corrected["data"]["unexpected_cartons"])
+        self.assertEqual("001234", corrected["data"]["surplus_events"][0]["corrected_by"]["registration"])
 
     def test_latest_wms_report_is_discovered_and_imported_by_opaque_id(self) -> None:
         report = self.downloads / "relatorio_ConsultaPaleteDistribuicaoAgrupada (3).csv"
@@ -877,7 +1314,7 @@ class OfficialHttpFlowTests(unittest.TestCase):
             {"caixa_estoque": "FORA-DO-PALETE"},
         )
         self.assertEqual(200, extra_status)
-        self.assertEqual("DIVERGENTE", extra_body["data"]["result"])
+        self.assertEqual("SOBRA", extra_body["data"]["result"])
         self.assertEqual(1, extra_body["data"]["summary"]["total_extra"])
 
         finish_status, finish_body, _ = self.client.request(
@@ -1077,6 +1514,7 @@ class StaticInterfaceContractTests(unittest.TestCase):
         cls.conference = (cls.root / "index.html").read_text(encoding="utf-8")
         cls.upload_js = (cls.root / "static/js/upload.js").read_text(encoding="utf-8")
         cls.conference_js = (cls.root / "static/js/conference.js").read_text(encoding="utf-8")
+        cls.sync_js = (cls.root / "static/js/sync.js").read_text(encoding="utf-8")
         cls.access_js = (cls.root / "static/js/access.js").read_text(encoding="utf-8")
 
     def test_access_has_visible_quick_registration_control_and_external_module(self) -> None:
@@ -1133,11 +1571,32 @@ class StaticInterfaceContractTests(unittest.TestCase):
         self.assertIn("Selecione o arquivo, a origem e a operação para revisar a importação.", self.upload_js)
 
     def test_active_conference_screen_is_backend_recovered_and_new_import_is_exclusive(self) -> None:
-        self.assertIn('id="actions-card" class="card actions-card" hidden', self.conference)
+        self.assertNotIn('id="actions-card"', self.conference)
+        self.assertIn('class="header-actions"', self.conference)
+        self.assertLess(
+            self.conference.index('id="logout-button"'),
+            self.conference.index('id="new-import-button"'),
+        )
+        self.assertLess(
+            self.conference.index('id="new-import-button"'),
+            self.conference.index('id="sync-pending-button"'),
+        )
+        self.assertIn('id="sync-pending-count"', self.conference)
+        self.assertIn('id="sync-status"', self.conference)
         self.assertIn("loadActiveConference", (self.root / "static/js/main.js").read_text(encoding="utf-8"))
+        self.assertIn("bindSync", (self.root / "static/js/main.js").read_text(encoding="utf-8"))
         self.assertIn("routes.activeConference", self.conference_js)
         self.assertIn('$("#new-import-button").hidden = isActiveConference(data)', self.conference_js)
         self.assertIn('$("#new-import-button").hidden = false', self.conference_js)
+        self.assertNotIn("/" + "sincron" + "izacao/", self.conference_js)
+        self.assertNotIn("window.open", self.conference_js)
+        self.assertNotIn('addEventListener("message"', self.conference_js)
+        self.assertIn("routes.syncPending", self.sync_js)
+        self.assertIn("routes.syncStatus", self.sync_js)
+        self.assertNotIn("setInterval", self.sync_js)
+        self.assertNotIn("window.open", self.sync_js)
+        self.assertNotIn("postMessage", self.sync_js)
+        self.assertNotIn("BroadcastChannel", self.sync_js)
         self.assertIn('await load(created.public_id, created)', self.upload_js)
         self.assertNotIn("new Date().toLocaleString", self.upload_js)
 
@@ -1145,14 +1604,15 @@ class StaticInterfaceContractTests(unittest.TestCase):
         self.assertIn('$("#carton-list").replaceChildren()', self.conference_js)
         self.assertIn('$("#extra-list").replaceChildren()', self.conference_js)
         self.assertIn('$("#progress").value = 0', self.conference_js)
-        self.assertIn('finishModal.close(); showImportCard();', self.conference_js)
+        self.assertIn('finishModal.close();', self.conference_js)
+        self.assertIn('showImportCard();', self.conference_js)
         self.assertNotIn('if (state.latest_conference)', self.conference_js)
 
     def test_divergences_are_statuses_only_without_resolution_flow(self) -> None:
         for status in ("DUPLICADO", "FALTA"):
             self.assertIn(f'"{status}"', self.conference_js)
         self.assertIn('data.unexpected_cartons || []', self.conference_js)
-        self.assertIn('item.append(code)', self.conference_js)
+        self.assertNotIn('state.textContent = "SOBRA"', self.conference_js)
         self.assertNotIn('Resolver', self.conference_js)
         self.assertNotIn('/divergences/', self.conference_js)
         self.assertNotIn('summary-divergences-', self.conference)
@@ -1160,11 +1620,96 @@ class StaticInterfaceContractTests(unittest.TestCase):
     def test_manual_finish_modal_and_open_status_contract_exist(self) -> None:
         self.assertIn('id="finish-modal"', self.conference)
         self.assertIn('id="finish-form"', self.conference)
+        self.assertIn('id="finish-surplus-warning"', self.conference)
+        self.assertIn("ATENÇÃO — EXISTEM SOBRAS", self.conference_js)
+        self.assertIn("Sim, tratei todas as sobras", self.conference_js)
+        self.assertIn("Voltar para a conferência", self.conference)
+        self.assertIn("confirmar_sobras: confirmSurpluses", self.conference_js)
         self.assertNotIn('id="completion-notice"', self.conference)
         self.assertIn("100% conferido — aguardando finalização", self.conference_js)
         self.assertIn('data.status === "EM_ABERTO"', self.conference_js)
-        self.assertIn('finishModal.close(); showImportCard();', self.conference_js)
+        self.assertIn('finishModal.close();', self.conference_js)
+        self.assertIn('showImportCard();', self.conference_js)
         self.assertIn('addEventListener("submit", async (event)', self.conference_js)
+
+    def test_surplus_alert_is_hidden_by_default_and_derived_from_official_state(self) -> None:
+        styles = (self.root / "static/styles.css").read_text(encoding="utf-8")
+        self.assertIn('id="surplus-alert" class="surplus-alert"', self.conference)
+        self.assertIn('aria-atomic="true" hidden', self.conference)
+        self.assertIn('role="alert"', self.conference)
+        self.assertIn('aria-live="assertive"', self.conference)
+        for element_id in (
+            "surplus-alert-title",
+            "surplus-alert-summary",
+            "surplus-alert-code",
+            "surplus-alert-guidance",
+        ):
+            self.assertIn(f'id="{element_id}"', self.conference)
+        self.assertIn("position: fixed", styles)
+        self.assertIn("pointer-events: none", styles)
+        self.assertIn(".surplus-alert[hidden] { display: none !important; }", styles)
+        self.assertIn("function renderSurplusAlert(data = conference)", self.conference_js)
+        self.assertIn("if (!isActiveConference(data))", self.conference_js)
+        self.assertIn("data?.summary?.total_extra", self.conference_js)
+        self.assertIn("const latest = extras.at(-1)", self.conference_js)
+        self.assertIn("ATENÇÃO — SOBRA IDENTIFICADA", self.conference_js)
+        self.assertIn("ATENÇÃO — SOBRAS IDENTIFICADAS", self.conference_js)
+        self.assertIn("alert.hidden = !shouldDisplay", self.conference_js)
+        self.assertIn("renderSurplusAlert(data);", self.conference_js)
+        self.assertNotIn("SURPLUS_ALERT_DURATION_MS", self.conference_js)
+        self.assertNotIn("surplusAlertTimer", self.conference_js)
+        self.assertNotIn("surplusAlertQueue", self.conference_js)
+        self.assertNotIn("queueSurplusAlert", self.conference_js)
+
+    def test_surplus_alert_lifecycle_hides_for_finish_and_resets_only_after_exit(self) -> None:
+        self.assertIn("function resetSurplusAlert()", self.conference_js)
+        self.assertIn("resetSurplusAlert();", self.conference_js)
+        self.assertIn("function suppressSurplusAlertForFinish()", self.conference_js)
+        self.assertIn("function restoreSurplusAlertAfterFinishModal()", self.conference_js)
+        self.assertIn("suppressSurplusAlertForFinish();", self.conference_js)
+        self.assertIn('finishModal.addEventListener("close"', self.conference_js)
+        self.assertIn("restoreSurplusAlertAfterFinishModal();", self.conference_js)
+        self.assertIn("if (finishModal.open) finishModal.close();", self.conference_js)
+        self.assertIn("restoreSurplusAlertAfterFinishModal();", self.conference_js)
+        self.assertIn("finishModal.close();", self.conference_js)
+        self.assertIn("showImportCard();", self.conference_js)
+        self.assertIn('cancelModal.close(); showImportCard();', self.conference_js)
+        self.assertIn("const scanQueue = []", self.conference_js)
+        self.assertIn("processNextScan", self.conference_js)
+        self.assertNotIn("input.disabled = true", self.conference_js)
+        self.assertNotIn("input.disabled = false", self.conference_js)
+
+    def test_individual_surplus_correction_interface_uses_event_id_and_clears_state(self) -> None:
+        styles = (self.root / "static/styles.css").read_text(encoding="utf-8")
+        extras_renderer = self.conference_js.split("function renderExtras(extras)", 1)[1].split("export function render", 1)[0]
+        self.assertIn('id="surplus-correction-notice"', self.conference)
+        self.assertIn('id="surplus-correction-code"', self.conference)
+        self.assertIn('id="cancel-surplus-correction"', self.conference)
+        self.assertIn("CORREÇÃO DE SOBRA", self.conference)
+        self.assertIn('correct.textContent = "Corrigir sobra"', self.conference_js)
+        self.assertIn("correct.dataset.surplusEventId", self.conference_js)
+        self.assertIn("let surplusCorrection = null", self.conference_js)
+        self.assertIn("function resetSurplusCorrection()", self.conference_js)
+        self.assertIn("function renderSurplusCorrection(data = conference)", self.conference_js)
+        self.assertIn("/correct-surplus", self.conference_js)
+        self.assertIn("surplus_event_id: correction.eventId", self.conference_js)
+        self.assertIn("CODIGO_CORRECAO_INCORRETO", self.conference_js)
+        self.assertIn("resetSurplusCorrection();", self.conference_js)
+        self.assertIn('alert.setAttribute("aria-hidden", "true")', self.conference_js)
+        self.assertIn("if (total <= 0 || !extras.length)", self.conference_js)
+        self.assertIn(".surplus-correction-notice", styles)
+        self.assertIn(".surplus-correction-notice[hidden] { display: none !important; }", styles)
+        self.assertIn(".correct-surplus-button", styles)
+        self.assertIn("item.replaceChildren(code, correct);", extras_renderer)
+        for unwanted in ('"SOBRA"', "Leitura #", "first_seen_at", "scan_order", 'createElement("time")'):
+            self.assertNotIn(unwanted, extras_renderer)
+
+    def test_finish_button_uses_pending_surplus_total_without_page_refresh(self) -> None:
+        self.assertIn("const pendingSurpluses = Number(summary.total_extra || 0);", self.conference_js)
+        self.assertIn("const canFinish = summary.can_finish && pendingSurpluses === 0;", self.conference_js)
+        self.assertIn('$("#finish-button").disabled = !canFinish;', self.conference_js)
+        self.assertIn('$("#finish-button").classList.toggle("ready-to-finish", active && canFinish);', self.conference_js)
+        self.assertIn("render(result);", self.conference_js)
 
     def test_scan_keeps_caixa_estoque_as_string_and_restart_is_absent(self) -> None:
         self.assertIn('String(value ?? "").trim()', self.conference_js)
