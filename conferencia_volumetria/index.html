@@ -8,39 +8,23 @@
 </head>
 <body>
     <main class="layout">
-        <header class="page-header">
-            <div>
-                <p class="eyebrow">CONFERÊNCIA FÍSICA</p>
-            </div>
-            <div class="header-tools">
-                <div class="header-actions" aria-label="Ações da conferência">
-                    <button id="logout-button" class="secondary header-action" type="button" title="Trocar colaborador">
-                        <svg class="header-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h11l-3-3m3 3-3 3M17 17H6l3 3m-3-3 3-3"/></svg>
-                        <span class="header-action__label">Trocar colaborador</span>
-                    </button>
-                    <button id="new-import-button" class="header-action" type="button" title="Nova importação" hidden>
-                        <svg class="header-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-                        <span class="header-action__label">Nova importação</span>
-                    </button>
-                    <button id="sync-pending-button" class="secondary header-action" type="button" title="Sincronizar pendentes">
-                        <svg class="header-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 9A7 7 0 0 1 18.5 6.5L20 12M4 12l1.5 5.5A7 7 0 0 0 17.9 15"/></svg>
-                        <span class="header-action__label">Sincronizar pendentes</span>
-                        <span id="sync-pending-count" class="sync-count" hidden>0</span>
-                    </button>
-                </div>
-                <p id="sync-status" class="sync-status" data-state="unknown" aria-live="polite">
-                    <span class="sync-status__dot" aria-hidden="true"></span>
-                    <span id="sync-status-text">Verificando sincronização...</span>
-                </p>
-            </div>
-        </header>
-
         <section id="conference" class="card" hidden>
             <div class="conference-heading">
                 <p class="eyebrow">PALETE ATIVO</p>
                 <div class="conference-heading-state">
                     <h2 id="summary-id"></h2>
                     <span id="summary-status" class="status-badge"></span>
+                </div>
+                <div class="conference-heading-actions" aria-label="Ações da conferência">
+                    <button id="logout-button" class="secondary conference-action" type="button" title="Trocar colaborador" aria-label="Trocar colaborador">
+                        <svg class="conference-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h11l-3-3m3 3-3 3M17 17H6l3 3m-3-3 3-3"/></svg>
+                    </button>
+                    <button id="new-import-button" class="conference-action" type="button" title="Nova importação" aria-label="Nova importação" hidden>
+                        <svg class="conference-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                    </button>
+                    <button id="sync-pending-button" class="secondary conference-action" type="button" title="Sincronizar pendentes" aria-label="Sincronizar pendentes">
+                        <svg class="conference-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-4M4 5v4h4M4 13a8 8 0 0 0 14.9 4M20 19v-4h-4"/></svg>
+                    </button>
                 </div>
             </div>
             <p id="summary-file" class="helper"></p>
@@ -63,7 +47,7 @@
                 <article class="danger-card"><span>Sobras</span><strong id="summary-surplus">0</strong></article>
                 <article><span>Duplicadas</span><strong id="summary-duplicate">0</strong></article>
                 <article><span>Percentual</span><strong id="summary-coverage">0%</strong></article>
-                <article><span>Classe do palete</span><strong id="summary-pallet-class">NÃO INFORMADO</strong></article>
+                <article id="summary-pallet-class-card"><span>Classe do palete</span><strong id="summary-pallet-class">NÃO INFORMADO</strong></article>
             </div>
 
             <progress id="progress" value="0" max="100" aria-label="Progresso da conferência"></progress>
@@ -175,6 +159,9 @@
         <span id="surplus-alert-summary"></span>
         <span id="surplus-alert-code"></span>
         <span id="surplus-alert-guidance"></span>
+    </aside>
+    <aside id="mixed-pallet-alert" class="mixed-pallet-alert" role="alert" aria-live="assertive" aria-atomic="true" hidden aria-hidden="true">
+        <strong>O PALETE ESTÁ MISTO E PRECISA SER TRATADO ANTES DA FINALIZAÇÃO.</strong>
     </aside>
     <script type="module" src="/static/js/main.js"></script>
 </body>

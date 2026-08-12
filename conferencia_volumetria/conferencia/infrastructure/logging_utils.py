@@ -16,8 +16,6 @@ _SENSITIVE_KEYS = (
     "credential(?:s)?",
     "nonce",
     "password",
-    "sync[_-]?shared[_-]?secret",
-    "shared[_-]?secret",
     "secret",
     "senha",
     "state",

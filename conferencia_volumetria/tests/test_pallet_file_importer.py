@@ -41,6 +41,15 @@ class PalletFileImporterTests(unittest.TestCase):
             source = self._csv(name, f"CAIXA_ESTOQUE{separator}OUTRA\n{code}{separator}A\n")
             self.assertEqual([code], self.importer.read_carton_codes(source, ".csv"))
 
+    def test_csv_cp1252_fallback_preserves_textual_class(self) -> None:
+        source = self.path / "legacy.csv"
+        source.write_bytes("CAIXA_ESTOQUE;DS_CLASSE\n0001;Vestuário\n".encode("cp1252"))
+
+        self.assertEqual(
+            [{"caixa_estoque": "0001", "ds_classe": "VESTUÁRIO"}],
+            self.importer.read_expected_items(source, ".csv"),
+        )
+
     def test_xlsx_text_preserves_zeros_and_varchar2_header(self) -> None:
         code = "00009999990462159232"
         source = self._xlsx("text.xlsx", [code], "  CAIXA_ESTOQUE   VARCHAR2 ")
@@ -56,7 +65,7 @@ class PalletFileImporterTests(unittest.TestCase):
 
     def test_long_numeric_xlsx_is_rejected_as_precision_risk(self) -> None:
         source = self._xlsx("numeric.xlsx", [9999999904621592320])
-        with self.assertRaisesRegex(ExcelReadError, r"codigos longos armazenados como numero"):
+        with self.assertRaisesRegex(ExcelReadError, r"códigos longos armazenados como número"):
             self.importer.read_carton_codes(source, ".xlsx")
 
     def test_signature_is_order_and_filename_independent_but_count_sensitive(self) -> None:

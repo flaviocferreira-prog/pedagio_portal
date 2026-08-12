@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import os
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
-from conferencia.infrastructure.settings import _sync_float, _sync_int
 from conferencia.infrastructure.logging_utils import (
     log_http_access,
     log_sanitized_exception,
@@ -58,38 +55,3 @@ class SanitizedLoggingTests(unittest.TestCase):
         with self.assertLogs("conferencia", level="ERROR") as errors:
             log_sanitized_exception("request", RuntimeError(f"password={secret}"))
         self.assertNotIn(secret, "\n".join(captured.output + errors.output))
-
-    def test_sync_shared_secret_name_is_redacted(self) -> None:
-        secret = "sync-secret-must-never-appear"
-        redacted = redact_for_log(f"SYNC_SHARED_SECRET={secret}")
-        self.assertIn("[REDACTED]", redacted)
-        self.assertNotIn(secret, redacted)
-
-
-class SyncSettingsTests(unittest.TestCase):
-    def test_invalid_numeric_values_fall_back_without_breaking_portal_import(self) -> None:
-        with patch.dict(
-            os.environ,
-            {
-                "TEST_SYNC_INT": "not-a-number",
-                "TEST_SYNC_FLOAT": "not-a-number",
-            },
-        ):
-            self.assertEqual(30, _sync_int("TEST_SYNC_INT", 30, minimum=1))
-            self.assertEqual(2.0, _sync_float("TEST_SYNC_FLOAT", 2.0, minimum=0.0))
-
-    def test_non_finite_and_out_of_range_values_are_safely_bounded(self) -> None:
-        with patch.dict(
-            os.environ,
-            {
-                "TEST_SYNC_NAN": "nan",
-                "TEST_SYNC_INFINITY": "inf",
-                "TEST_SYNC_BATCH": "1000",
-            },
-        ):
-            self.assertEqual(2.0, _sync_float("TEST_SYNC_NAN", 2.0, minimum=0.0))
-            self.assertEqual(2.0, _sync_float("TEST_SYNC_INFINITY", 2.0, minimum=0.0))
-            self.assertEqual(
-                100,
-                _sync_int("TEST_SYNC_BATCH", 10, minimum=1, maximum=100),
-            )

@@ -114,9 +114,12 @@ class SQLiteDatabase:
             if 21 not in applied:
                 self._migration_021_individual_surplus_treatment(connection)
                 self._record(connection, 21, "tratamento individual auditavel por evento de sobra")
-            if 22 not in applied:
-                self._migration_022_backend_sync_state(connection)
-                self._record(connection, 22, "fila autoritativa de sincronizacao backend")
+            if 23 not in applied:
+                self._migration_023_remove_external_queue(connection)
+                self._record(connection, 23, "remocao da fila externa desativada")
+            if 24 not in applied:
+                self._migration_024_google_sync_state(connection)
+                self._record(connection, 24, "estado local da sincronizacao manual com Google Sheets")
             violations = connection.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise RuntimeError("A migração de caixa estoque violou chaves estrangeiras.")
@@ -927,15 +930,22 @@ class SQLiteDatabase:
         )
 
     @staticmethod
-    def _migration_022_backend_sync_state(connection: sqlite3.Connection) -> None:
-        """Creates a new queue without depending on legacy Google columns."""
+    def _migration_023_remove_external_queue(connection: sqlite3.Connection) -> None:
+        """Removes only the retired external-delivery queue, preserving pallet data."""
         connection.executescript(
             """
-            CREATE TABLE IF NOT EXISTS conference_sync_state (
+            DROP TABLE IF EXISTS conference_sync_state;
+            """
+        )
+
+    @staticmethod
+    def _migration_024_google_sync_state(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS conference_google_sync_state (
                 pallet_id INTEGER PRIMARY KEY REFERENCES pallets(id) ON DELETE RESTRICT,
                 status TEXT NOT NULL DEFAULT 'PENDENTE'
-                    CHECK(status IN ('PENDENTE', 'SINCRONIZANDO', 'SINCRONIZADA')),
-                reserved_at TEXT,
+                    CHECK(status IN ('PENDENTE', 'SINCRONIZADO')),
                 synchronized_at TEXT,
                 attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
                 last_attempt_at TEXT,
@@ -943,16 +953,14 @@ class SQLiteDatabase:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_conference_sync_status
-                ON conference_sync_state(status, updated_at, pallet_id);
-            INSERT OR IGNORE INTO conference_sync_state(
+            CREATE INDEX IF NOT EXISTS idx_google_sync_pending
+                ON conference_google_sync_state(status, updated_at, pallet_id);
+            INSERT OR IGNORE INTO conference_google_sync_state(
                 pallet_id, status, created_at, updated_at
             )
-            SELECT id, 'PENDENTE',
-                   COALESCE(finished_at, updated_at, created_at),
+            SELECT id, 'PENDENTE', COALESCE(finished_at, updated_at, created_at),
                    COALESCE(finished_at, updated_at, created_at)
-            FROM pallets
-            WHERE conference_status = 'FINALIZADA';
+            FROM pallets WHERE conference_status = 'FINALIZADA';
             """
         )
 

@@ -57,6 +57,11 @@ class AutomaticReportService:
         }
 
     def read(self, file_id: object) -> tuple[str, bytes]:
+        filename, content, _directory = self.read_for_import(file_id)
+        return filename, content
+
+    def read_for_import(self, file_id: object) -> tuple[str, bytes, Path]:
+        """Returns the validated report and its Downloads directory for post-import cleanup."""
         if not isinstance(file_id, str):
             raise ValidationError("O arquivo automático selecionado é inválido.", code="AUTOMATIC_FILE_INVALID")
         report = self._reports.pop(file_id, None)
@@ -74,7 +79,7 @@ class AutomaticReportService:
         if stats.st_size > self.max_upload_bytes:
             raise PayloadTooLargeError("O arquivo automático excede o limite permitido.")
         try:
-            return path.name, path.read_bytes()
+            return path.name, path.read_bytes(), report.downloads_directory
         except OSError as error:
             raise NotFoundError("Não foi possível ler o arquivo automático. Selecione-o manualmente.", code="AUTOMATIC_FILE_NOT_FOUND") from error
 

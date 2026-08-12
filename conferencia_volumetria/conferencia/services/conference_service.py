@@ -16,6 +16,7 @@ from conferencia.domain.entities import (
 )
 from conferencia.infrastructure.settings import AppSettings
 from conferencia.readers.excel_reader import PalletFileImporter
+from conferencia.regras_conferencia import mensagem_bloqueio_finalizacao_por_classe
 from conferencia.repositories.pallet_repository import (
     ActiveConferenceError,
     AmbiguousBoxCodeError,
@@ -324,6 +325,15 @@ class ConferenceService:
             result = self.get_pallet(pallet["public_id"])
             result["message"] = "A conferência já está finalizada."
             return result
+        state = self.get_pallet(pallet["public_id"])
+        class_block_message = mensagem_bloqueio_finalizacao_por_classe(
+            pallet["import_operation"], state["pallet_class"]
+        )
+        if class_block_message:
+            raise ConflictError(
+                class_block_message,
+                code="PALLET_MISTO_NAO_PERMITIDO",
+            )
         try:
             self.repository.finish(
                 pallet["id"],
@@ -416,7 +426,7 @@ class ConferenceService:
         except RepositoryStateError as error:
             self._raise_state_error(error, action="cancel")
         result = self.get_pallet(pallet["public_id"])
-        result["message"] = "ConferÃªncia cancelada. O histÃ³rico foi preservado e uma nova importaÃ§Ã£o estÃ¡ liberada."
+        result["message"] = "Conferência cancelada. O histórico foi preservado e uma nova importação está liberada."
         return result
 
     def _find(self, public_id: str) -> sqlite3.Row:
@@ -482,7 +492,7 @@ class ConferenceService:
             ) from error
         if error.state == "RESTART_DISABLED":
             raise ConflictError(
-                "O reinÃ­cio foi removido para preservar a conferÃªncia.",
+                "O reinício foi removido para preservar a conferência.",
                 code="REINICIO_NAO_PERMITIDO",
             ) from error
         if action == "restart" and error.state == "FINISHED":

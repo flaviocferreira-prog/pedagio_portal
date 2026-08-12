@@ -26,10 +26,9 @@ def main() -> int:
     from conferencia.services.acesso_service import AcessoService
     from conferencia.services.automatic_report_service import AutomaticReportService
     from conferencia.services.conference_service import ConferenceService
-    from conferencia.sync.client import AppsScriptClient
-    from conferencia.sync.repository import SyncRepository
-    from conferencia.sync.scheduler import SyncScheduler
-    from conferencia.sync.service import SyncService
+    from conferencia.sincronizacao.client import GoogleSheetsClient
+    from conferencia.sincronizacao.repository import SincronizacaoRepository
+    from conferencia.sincronizacao.service import SincronizacaoService
     from conferencia.web import ApplicationHandler
 
     configure_logging()
@@ -43,23 +42,6 @@ def main() -> int:
     database = SQLiteDatabase()
     database.initialize()
     repository = PalletRepository(database)
-    sync_service = SyncService(
-        SyncRepository(database),
-        AppsScriptClient(
-            settings.apps_script_url,
-            settings.sync_shared_secret,
-            connect_timeout_seconds=settings.sync_connect_timeout_seconds,
-            read_timeout_seconds=settings.sync_read_timeout_seconds,
-        ),
-        batch_size=settings.sync_batch_size,
-        max_attempts=settings.sync_max_attempts,
-        retry_delay_seconds=settings.sync_retry_delay_seconds,
-        reservation_timeout_seconds=settings.sync_reservation_timeout_seconds,
-    )
-    sync_scheduler = SyncScheduler(
-        sync_service,
-        interval_seconds=settings.sync_interval_minutes * 60,
-    )
     if args.port != settings.server_port:
         settings = replace(settings, server_port=args.port)
     ApplicationHandler.controller = ConferenceController(ConferenceService(repository, PalletFileImporter(), settings))
@@ -67,16 +49,25 @@ def main() -> int:
     ApplicationHandler.sessions = SessionManager()
     ApplicationHandler.max_json_bytes = settings.max_json_bytes
     ApplicationHandler.automatic_report_service = AutomaticReportService(settings.max_upload_bytes)
-    ApplicationHandler.sync_service = sync_service
+    ApplicationHandler.sincronizacao_service = SincronizacaoService(
+        SincronizacaoRepository(database),
+        GoogleSheetsClient(
+            settings.google_sync_url,
+            settings.google_sync_token,
+            settings.google_sync_connect_timeout_seconds,
+            settings.google_sync_read_timeout_seconds,
+        ),
+        batch_size=max(1, settings.google_sync_batch_size),
+        max_attempts=max(1, settings.google_sync_max_attempts),
+        retry_delay_seconds=max(0.0, settings.google_sync_retry_delay_seconds),
+    )
     server = ThreadingHTTPServer((args.host, args.port), ApplicationHandler)
-    sync_scheduler.start()
     logger.info("server_started host=%s port=%s", args.host, args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("server_stopped reason=keyboard_interrupt")
     finally:
-        sync_scheduler.stop()
         server.server_close()
     return 0
 

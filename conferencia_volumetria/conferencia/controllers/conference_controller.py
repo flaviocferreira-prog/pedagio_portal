@@ -3,6 +3,7 @@ from __future__ import annotations
 from conferencia.domain.entities import CollaboratorContext, ConferenceImport
 from conferencia.services.conference_service import ConferenceService, ValidationError
 from conferencia.services.automatic_report_service import AutomaticReportService
+from conferencia.services.limpeza_downloads import limpar_relatorios_wms
 from base64 import b64encode
 
 
@@ -37,11 +38,18 @@ class ConferenceController:
     def import_automatic_pallet(
         self, payload: dict[str, object], collaborator: CollaboratorContext, reports: AutomaticReportService
     ) -> dict:
-        filename, content = reports.read(payload.get("automatic_file_id"))
+        filename, content, downloads_directory = reports.read_for_import(
+            payload.get("automatic_file_id")
+        )
         command_payload = dict(payload)
         command_payload["filename"] = filename
         command_payload["content_base64"] = b64encode(content).decode("ascii")
-        return self.import_pallet(command_payload, collaborator)
+        result = self.import_pallet(command_payload, collaborator)
+        limpar_relatorios_wms(
+            arquivo_em_uso=filename,
+            downloads_directory=downloads_directory,
+        )
+        return result
 
     def get_pallet(
         self, public_id: str, collaborator: CollaboratorContext

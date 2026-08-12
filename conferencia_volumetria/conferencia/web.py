@@ -30,7 +30,8 @@ from conferencia.services.conference_service import (
     ValidationError,
 )
 from conferencia.services.automatic_report_service import AutomaticReportService
-from conferencia.sync.service import SyncService
+from conferencia.sincronizacao.client import GoogleSyncError
+from conferencia.sincronizacao.service import SincronizacaoEmAndamentoError, SincronizacaoService
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_ROOT = PROJECT_ROOT / "static"
@@ -46,7 +47,7 @@ class ApplicationHandler(BaseHTTPRequestHandler):
     sessions: SessionManager
     max_json_bytes = 15 * 1024 * 1024
     automatic_report_service: AutomaticReportService | None = None
-    sync_service: SyncService | None = None
+    sincronizacao_service: SincronizacaoService | None = None
 
     def do_GET(self) -> None:
         parsed_url = urlparse(self.path)
@@ -57,12 +58,6 @@ class ApplicationHandler(BaseHTTPRequestHandler):
             if self._session() is None:
                 return self._redirect("/")
             return self._serve_file(PROJECT_ROOT / "index.html")
-        if path == "/api/sync/status":
-            if self._session() is None:
-                return self._collaborator_not_identified()
-            if self.sync_service is None:
-                return self._sync_unavailable()
-            return self._handle(self.sync_service.status)
         if path.startswith("/api/colaboradores/"):
             registration = path.removeprefix("/api/colaboradores/").strip("/")
             if not registration or "/" in registration:
@@ -115,14 +110,16 @@ class ApplicationHandler(BaseHTTPRequestHandler):
             return self._update_collaborator(path)
         if path == "/api/logout":
             return self._logout()
-        if path == "/api/sync/pending":
+        if path == "/api/sincronizacao/pendentes":
             if self._session() is None:
                 return self._collaborator_not_identified()
-            if self.sync_service is None:
-                return self._sync_unavailable()
-            return self._handle(
-                lambda: self.sync_service.sync_all_pending(trigger="manual").as_dict()
-            )
+            if self.sincronizacao_service is None:
+                return self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "SINCRONIZACAO_INDISPONIVEL",
+                    "A sincronizacao nao esta disponivel.",
+                )
+            return self._handle(self.sincronizacao_service.sincronizar_todos_pendentes)
         if path != "/api/conferences" and not path.startswith("/api/conferences/"):
             return self._not_found()
         session = self._session()
@@ -208,6 +205,10 @@ class ApplicationHandler(BaseHTTPRequestHandler):
             self._json_application_error(HTTPStatus.NOT_FOUND, error)
         except ConflictError as error:
             self._json_application_error(HTTPStatus.CONFLICT, error)
+        except SincronizacaoEmAndamentoError as error:
+            self._json_error(HTTPStatus.CONFLICT, "SINCRONIZACAO_EM_ANDAMENTO", str(error))
+        except GoogleSyncError as error:
+            self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "SINCRONIZACAO_FALHOU", str(error))
         except Exception as error:
             log_sanitized_exception("api_unexpected_error", error)
             self._json_error(
@@ -340,13 +341,6 @@ class ApplicationHandler(BaseHTTPRequestHandler):
             "COLABORADOR_NAO_IDENTIFICADO",
             "Identifique o colaborador antes de realizar o upload.",
             {"redirect_url": "/"},
-        )
-
-    def _sync_unavailable(self) -> None:
-        self._json_error(
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            "SYNC_UNAVAILABLE",
-            "O serviço de sincronização não está disponível.",
         )
 
     def _not_found(self) -> None:

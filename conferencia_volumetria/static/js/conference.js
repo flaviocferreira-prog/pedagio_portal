@@ -17,6 +17,14 @@ const AUTO_SCAN_DELAY_MS = 160;
 
 function normalizeCaixaEstoque(value) { return String(value ?? "").trim(); }
 function isActiveConference(data) { return data && data.status === "EM_ABERTO"; }
+function requiresMixedPalletTreatment(data) { return data?.summary?.class_requires_treatment === true; }
+function renderMixedPalletAlert(data = conference) {
+  const mixed = requiresMixedPalletTreatment(data);
+  const alert = $("#mixed-pallet-alert");
+  alert.hidden = !mixed;
+  alert.setAttribute("aria-hidden", String(!mixed));
+  $("#summary-pallet-class-card").classList.toggle("mixed-pallet-class", mixed);
+}
 function resetSurplusAlert() {
   const alert = $("#surplus-alert");
   surplusAlertSuppressedForFinish = false;
@@ -101,11 +109,13 @@ export function showImportCard() {
   ["#summary-expected", "#summary-confirmed", "#summary-pending", "#summary-surplus", "#summary-duplicate"].forEach((selector) => { $(selector).textContent = "0"; });
   $("#summary-coverage").textContent = "0%";
   $("#summary-pallet-class").textContent = "NÃO INFORMADO";
+  renderMixedPalletAlert();
   $("#progress").value = 0;
   $("#box-count").textContent = "0 caixas";
   $("#extra-count").textContent = "0 sobras";
   $("#summary-finalized-wrap").hidden = true;
-  $("#conference").hidden = true;
+  $("#conference").hidden = false;
+  $("#conference").classList.add("conference--empty");
   $("#new-import-button").hidden = false;
   startTimer({});
 }
@@ -117,6 +127,7 @@ function renderSummary(data) {
   sessionStorage.setItem("conference_public_id", data.public_id);
   $("#new-import-button").hidden = isActiveConference(data);
   $("#conference").hidden = false;
+  $("#conference").classList.remove("conference--empty");
   $("#summary-id").textContent = data.public_id;
   $("#summary-file").textContent = data.source_filename;
   const imported = data.importation || {};
@@ -140,6 +151,7 @@ function renderSummary(data) {
   $("#summary-duplicate").textContent = summary.total_duplicate_reads;
   $("#summary-coverage").textContent = `${summary.coverage_percent}%`;
   $("#summary-pallet-class").textContent = data.pallet_class || "NÃO INFORMADO";
+  renderMixedPalletAlert(data);
   $("#progress").value = summary.coverage_percent;
   $("#box-count").textContent = `${summary.total_expected} caixas`;
   $("#extra-count").textContent = `${summary.total_extra} sobras`;
@@ -320,7 +332,6 @@ export function bindConference() {
     try {
       const result = await api(`/api/conferences/${encodeURIComponent(conference.public_id)}/finish`, { method: "POST", body: JSON.stringify({ confirmar_sobras: confirmSurpluses }) });
       finishModal.close(); showImportCard();
-      window.dispatchEvent(new Event("sync-state-changed"));
       notify(result.message);
       $("#new-import-button").focus();
     } catch (error) {

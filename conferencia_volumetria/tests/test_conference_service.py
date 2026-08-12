@@ -31,9 +31,6 @@ from conferencia.services.conference_service import (
     ValidationError,
     ConferenceService,
 )
-from conferencia.sync.client import AppsScriptClient
-from conferencia.sync.repository import SyncRepository
-from conferencia.sync.service import SyncService
 from conferencia.web import ApplicationHandler
 
 
@@ -56,25 +53,6 @@ class ItemReader:
 
     def read_expected_items(self, file_path: Path, extension: str) -> list[dict[str, str]]:
         return self.items
-
-
-class SuccessfulHttpSyncClient:
-    configured = True
-
-    def __init__(self) -> None:
-        self.health_calls = 0
-        self.batches: list[list[dict[str, object]]] = []
-
-    def health_check(self) -> dict[str, object]:
-        self.health_calls += 1
-        return {"ok": True, "service": "apps-script", "sheets": True}
-
-    def send_batch(self, payloads: list[dict[str, object]]) -> list[dict[str, object]]:
-        self.batches.append(payloads)
-        return [
-            {"id_conferencia": payload["id_conferencia"], "status": "INSERTED"}
-            for payload in payloads
-        ]
 
 
 def minimal_xlsx(codes: list[str], *, numeric: bool = False) -> bytes:
@@ -728,7 +706,7 @@ class ConferenceServiceTests(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-        self.assertEqual(list(range(1, 23)), versions)
+        self.assertEqual([*range(1, 22), 23, 24], versions)
         with self.assertRaises(ValidationError):
             self.service.import_pallet(
                 ConferenceImport(
@@ -995,12 +973,6 @@ class OfficialHttpFlowTests(unittest.TestCase):
         TestHandler.controller = ConferenceController(service)
         TestHandler.acesso_service = AcessoService(self.collaborators, settings)
         TestHandler.sessions = SessionManager()
-        self.sync_service = SyncService(
-            SyncRepository(self.database),
-            AppsScriptClient("", ""),
-            sleeper=lambda _seconds: None,
-        )
-        TestHandler.sync_service = self.sync_service
         self.downloads = Path(self.tempdir.name) / "Downloads"
         self.downloads.mkdir()
         TestHandler.automatic_report_service = AutomaticReportService(settings.max_upload_bytes, (self.downloads,))
@@ -1074,8 +1046,6 @@ class OfficialHttpFlowTests(unittest.TestCase):
         self.assertEqual(401, status)
         self.assertEqual("COLABORADOR_NAO_IDENTIFICADO", body["error"]["code"])
         self.assertEqual("/", body["error"]["details"]["redirect_url"])
-        self.assertEqual(401, self.client.request("GET", "/api/sync/status")[0])
-        self.assertEqual(401, self.client.request("POST", "/api/sync/pending")[0])
         forbidden_message = "Matrícula é " + "obrigatória"
         self.assertNotIn(forbidden_message, json.dumps(body, ensure_ascii=False))
 
@@ -1095,72 +1065,9 @@ class OfficialHttpFlowTests(unittest.TestCase):
 
         self.assertEqual(200, finished_status)
         self.assertEqual("FINALIZADA", finished["data"]["status"])
-        self.assertNotIn("synchron" + "ization", finished["data"])
         self.assertEqual(200, active_status)
         self.assertFalse(active["data"]["has_active_conference"])
         self.assertIsNone(active["data"]["conference"])
-        with self.database.connection() as connection:
-            sync_state = connection.execute(
-                """
-                SELECT state.status
-                FROM conference_sync_state state
-                INNER JOIN pallets pallet ON pallet.id = state.pallet_id
-                WHERE pallet.public_id = ?
-                """,
-                (public_id,),
-            ).fetchone()
-        self.assertEqual("PENDENTE", sync_state["status"])
-        sync_status, sync_body, _ = self.client.request("GET", "/api/sync/status")
-        self.assertEqual(200, sync_status)
-        self.assertEqual(1, sync_body["data"]["pending"])
-        self.assertFalse(sync_body["data"]["configured"])
-        manual_status, manual_body, _ = self.client.request("POST", "/api/sync/pending")
-        self.assertEqual(200, manual_status)
-        self.assertEqual(1, manual_body["data"]["failed"])
-        self.assertFalse(manual_body["data"]["configured"])
-        legacy_root = "/" + "sincron" + "izacao"
-        self.assertEqual(404, self.client.request("GET", f"/api{legacy_root}/pendentes")[0])
-        self.assertEqual(404, self.client.request("POST", f"{legacy_root}/pendentes/preparar/", {})[0])
-
-    def test_manual_sync_endpoint_processes_the_real_local_queue(self) -> None:
-        self.client.request("POST", "/api/access", {"matricula": "001234"})
-        uploaded_status, uploaded, _ = self.client.request(
-            "POST",
-            "/api/conferences",
-            {
-                "filename": "sincronizar.csv",
-                "content_base64": b64encode(b"CAIXA_ESTOQUE\n0001\n").decode(),
-            },
-        )
-        self.assertEqual(201, uploaded_status)
-        public_id = uploaded["data"]["public_id"]
-        self.assertEqual(200, self.client.request("POST", f"/api/conferences/{public_id}/start")[0])
-        self.assertEqual(
-            200,
-            self.client.request(
-                "POST",
-                f"/api/conferences/{public_id}/scan",
-                {"caixa_estoque": "0001"},
-            )[0],
-        )
-        self.assertEqual(200, self.client.request("POST", f"/api/conferences/{public_id}/finish")[0])
-
-        client = SuccessfulHttpSyncClient()
-        self.sync_service.client = client
-        status, body, _ = self.client.request("POST", "/api/sync/pending")
-
-        self.assertEqual(200, status)
-        self.assertEqual(1, body["data"]["found"])
-        self.assertEqual(1, body["data"]["synchronized"])
-        self.assertEqual(0, body["data"]["failed"])
-        self.assertEqual(1, client.health_calls)
-        self.assertEqual(1, len(client.batches))
-        self.assertEqual(public_id, client.batches[0][0]["id_conferencia"])
-        self.assertEqual("0001", client.batches[0][0]["items"][0]["caixa_estoque"])
-        status_code, status_body, _ = self.client.request("GET", "/api/sync/status")
-        self.assertEqual(200, status_code)
-        self.assertEqual(0, status_body["data"]["pending"])
-        self.assertEqual(1, status_body["data"]["synchronized"])
 
     def test_finish_api_requires_explicit_boolean_surplus_confirmation(self) -> None:
         self.client.request("POST", "/api/access", {"matricula": "001234"})
@@ -1514,7 +1421,6 @@ class StaticInterfaceContractTests(unittest.TestCase):
         cls.conference = (cls.root / "index.html").read_text(encoding="utf-8")
         cls.upload_js = (cls.root / "static/js/upload.js").read_text(encoding="utf-8")
         cls.conference_js = (cls.root / "static/js/conference.js").read_text(encoding="utf-8")
-        cls.sync_js = (cls.root / "static/js/sync.js").read_text(encoding="utf-8")
         cls.access_js = (cls.root / "static/js/access.js").read_text(encoding="utf-8")
 
     def test_access_has_visible_quick_registration_control_and_external_module(self) -> None:
@@ -1572,31 +1478,24 @@ class StaticInterfaceContractTests(unittest.TestCase):
 
     def test_active_conference_screen_is_backend_recovered_and_new_import_is_exclusive(self) -> None:
         self.assertNotIn('id="actions-card"', self.conference)
-        self.assertIn('class="header-actions"', self.conference)
+        self.assertNotIn("CONFERÊNCIA FÍSICA", self.conference)
+        self.assertNotIn('class="page-header"', self.conference)
+        self.assertIn('class="conference-heading-actions"', self.conference)
         self.assertLess(
             self.conference.index('id="logout-button"'),
             self.conference.index('id="new-import-button"'),
         )
-        self.assertLess(
-            self.conference.index('id="new-import-button"'),
-            self.conference.index('id="sync-pending-button"'),
-        )
-        self.assertIn('id="sync-pending-count"', self.conference)
-        self.assertIn('id="sync-status"', self.conference)
+        self.assertNotIn("header-action__label", self.conference)
+        self.assertIn('aria-label="Trocar colaborador"', self.conference)
+        self.assertIn('aria-label="Nova importação"', self.conference)
+        self.assertIn('$("#conference").classList.add("conference--empty");', self.conference_js)
+        self.assertIn('$("#conference").classList.remove("conference--empty");', self.conference_js)
         self.assertIn("loadActiveConference", (self.root / "static/js/main.js").read_text(encoding="utf-8"))
-        self.assertIn("bindSync", (self.root / "static/js/main.js").read_text(encoding="utf-8"))
         self.assertIn("routes.activeConference", self.conference_js)
         self.assertIn('$("#new-import-button").hidden = isActiveConference(data)', self.conference_js)
         self.assertIn('$("#new-import-button").hidden = false', self.conference_js)
-        self.assertNotIn("/" + "sincron" + "izacao/", self.conference_js)
         self.assertNotIn("window.open", self.conference_js)
         self.assertNotIn('addEventListener("message"', self.conference_js)
-        self.assertIn("routes.syncPending", self.sync_js)
-        self.assertIn("routes.syncStatus", self.sync_js)
-        self.assertNotIn("setInterval", self.sync_js)
-        self.assertNotIn("window.open", self.sync_js)
-        self.assertNotIn("postMessage", self.sync_js)
-        self.assertNotIn("BroadcastChannel", self.sync_js)
         self.assertIn('await load(created.public_id, created)', self.upload_js)
         self.assertNotIn("new Date().toLocaleString", self.upload_js)
 
@@ -1678,6 +1577,23 @@ class StaticInterfaceContractTests(unittest.TestCase):
         self.assertIn("processNextScan", self.conference_js)
         self.assertNotIn("input.disabled = true", self.conference_js)
         self.assertNotIn("input.disabled = false", self.conference_js)
+
+    def test_mixed_pallet_has_visual_alert_and_uses_official_finish_state(self) -> None:
+        styles = (self.root / "static/styles.css").read_text(encoding="utf-8")
+        self.assertIn('id="summary-pallet-class-card"', self.conference)
+        self.assertIn('id="mixed-pallet-alert" class="mixed-pallet-alert"', self.conference)
+        self.assertIn(
+            "O PALETE ESTÁ MISTO E PRECISA SER TRATADO ANTES DA FINALIZAÇÃO.",
+            self.conference,
+        )
+        self.assertIn("function requiresMixedPalletTreatment(data)", self.conference_js)
+        self.assertIn("function renderMixedPalletAlert(data = conference)", self.conference_js)
+        self.assertIn("data?.summary?.class_requires_treatment === true", self.conference_js)
+        self.assertIn('classList.toggle("mixed-pallet-class", mixed)', self.conference_js)
+        self.assertIn("renderMixedPalletAlert(data);", self.conference_js)
+        self.assertIn(".summary .mixed-pallet-class strong { color: var(--red); }", styles)
+        self.assertIn(".mixed-pallet-alert[hidden] { display: none !important; }", styles)
+        self.assertIn("const canFinish = summary.can_finish && pendingSurpluses === 0;", self.conference_js)
 
     def test_individual_surplus_correction_interface_uses_event_id_and_clears_state(self) -> None:
         styles = (self.root / "static/styles.css").read_text(encoding="utf-8")

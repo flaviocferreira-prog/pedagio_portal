@@ -12,6 +12,10 @@ from conferencia.domain.entities import (
 )
 from conferencia.infrastructure.database import SQLiteDatabase
 from conferencia.infrastructure.timezones import SAO_PAULO_TIMEZONE
+from conferencia.regras_conferencia import (
+    identificar_classe_palete,
+    mensagem_bloqueio_finalizacao_por_classe,
+)
 from conferencia.repositories.conference_attempt_repository import ConferenceAttemptRepository
 from conferencia.repositories.conference_audit_repository import ConferenceAuditRepository
 from conferencia.repositories.divergence_repository import DivergenceRepository
@@ -414,6 +418,9 @@ class PalletRepository:
                 """,
                 (pallet["id"],),
             ).fetchall()
+        pallet_class = identificar_classe_palete(
+            row["ds_classe"] for row in cartons
+        )
         registration = pallet["collaborator_registration"] or pallet["collaborator_id"]
         workflow_status = str(pallet["conference_status"])
         return {
@@ -426,7 +433,7 @@ class PalletRepository:
             },
             "source_filename": pallet["source_filename"],
             "content_hash": pallet["content_hash"],
-            "pallet_class": self._pallet_class(cartons),
+            "pallet_class": pallet_class,
             "previous_conference_id": pallet["previous_conference_id"],
             "is_reconference": bool(pallet["is_reconference"]),
             "reconference_reason": pallet["reconference_reason"],
@@ -493,6 +500,11 @@ class PalletRepository:
                 counts["extra"],
                 counts["duplicate"],
                 divergence_counts,
+                class_requires_treatment=(
+                    mensagem_bloqueio_finalizacao_por_classe(
+                        pallet["import_operation"], pallet_class
+                    ) is not None
+                ),
             ),
             "cartons": [
                 {
@@ -951,21 +963,11 @@ class PalletRepository:
                     raise RepositoryStateError("CHANGED")
                 connection.execute(
                     """
-                    INSERT INTO conference_sync_state(
+                    INSERT INTO conference_google_sync_state(
                         pallet_id, status, created_at, updated_at
                     ) VALUES (?, 'PENDENTE', ?, ?)
                     ON CONFLICT(pallet_id) DO UPDATE SET
-                        status = CASE
-                            WHEN conference_sync_state.status = 'SINCRONIZADA'
-                                THEN 'SINCRONIZADA'
-                            ELSE 'PENDENTE'
-                        END,
-                        reserved_at = NULL,
-                        last_error = CASE
-                            WHEN conference_sync_state.status = 'SINCRONIZADA'
-                                THEN conference_sync_state.last_error
-                            ELSE NULL
-                        END,
+                        status = 'PENDENTE', synchronized_at = NULL, last_error = NULL,
                         updated_at = excluded.updated_at
                     """,
                     (pallet_id, now, now),
@@ -1175,14 +1177,11 @@ class PalletRepository:
         }.get(status, status)
 
     @staticmethod
-    def _pallet_class(cartons: list[sqlite3.Row]) -> str:
-        classes = {normalize_caixa_estoque(row["ds_classe"]).upper() for row in cartons if normalize_caixa_estoque(row["ds_classe"])}
-        return next(iter(classes)) if len(classes) == 1 else "MISTO" if classes else "NÃO INFORMADO"
-
-    @staticmethod
     def _summary(
         expected: int, confirmed: int, extra: int, duplicate: int,
         divergence_counts: dict | None = None,
+        *,
+        class_requires_treatment: bool = False,
     ) -> dict[str, int | float]:
         missing = max(0, expected - confirmed)
         coverage = min(
@@ -1209,5 +1208,6 @@ class PalletRepository:
             "divergences_resolved": divergence_counts["resolved"],
             "pending_divergences_by_type": divergence_counts["by_type"],
             "requires_surplus_treatment": extra > 0,
-            "can_finish": confirmed == expected,
+            "class_requires_treatment": class_requires_treatment,
+            "can_finish": confirmed == expected and not class_requires_treatment,
         }
