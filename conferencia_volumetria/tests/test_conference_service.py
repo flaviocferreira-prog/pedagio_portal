@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 from conferencia.controllers.conference_controller import ConferenceController
 from conferencia.domain.box_codes import content_hash_caixa_estoque
-from conferencia.domain.entities import CollaboratorContext, ConferenceImport
+from conferencia.domain.entities import CollaboratorContext
 from conferencia.infrastructure.database import SQLiteDatabase
 from conferencia.infrastructure.session_manager import SessionManager
 from conferencia.infrastructure.settings import AppSettings
@@ -24,13 +24,13 @@ from conferencia.readers.excel_reader import ExcelReadError, PalletFileImporter
 from conferencia.repositories.colaborador_repository import ColaboradorRepository
 from conferencia.repositories.pallet_repository import PalletRepository
 from conferencia.services.acesso_service import AcessoService
-from conferencia.services.automatic_report_service import AutomaticReportService
 from conferencia.services.conference_service import (
     ConflictError,
     InvalidScanError,
     ValidationError,
     ConferenceService,
 )
+from conferencia.services.upload import UploadService
 from conferencia.web import ApplicationHandler
 
 
@@ -112,16 +112,16 @@ class ConferenceServiceTests(unittest.TestCase):
         )
         self.repository = PalletRepository(self.database)
         settings = AppSettings(temporary_directory=Path(self.tempdir.name) / "uploads")
-        self.service = ConferenceService(self.repository, FixedPalletReader(), settings)
-        self.created = self.service.import_pallet(
-            ConferenceImport(
-                collaborator=self.actor,
-                filename="palete.xlsx",
-                content_base64=b64encode(b"excel").decode(),
-                origin="PORTAL",
-                operation="DIGITAL",
-                agenda="AGENDA TESTE",
-            )
+        self.service = ConferenceService(self.repository)
+        self.upload = UploadService(self.service, FixedPalletReader(), settings)
+        self.created = self.upload.importar_manual(
+            {
+                "filename": "palete.xlsx",
+                "content_base64": b64encode(b"excel").decode(),
+                "origin": "PORTAL",
+                "operation": "DIGITAL",
+                "agenda": "AGENDA TESTE",
+            }, self.actor,
         )
         self.public_id = self.created["public_id"]
 
@@ -132,16 +132,16 @@ class ConferenceServiceTests(unittest.TestCase):
         return self.service.start_pallet(self.public_id, self.actor)
 
     def import_codes(self, codes: list[str]) -> tuple[ConferenceService, dict]:
-        service = ConferenceService(
-            self.repository,
-            ConfiguredPalletReader(codes),
+        service = ConferenceService(self.repository)
+        upload = UploadService(
+            service, ConfiguredPalletReader(codes),
             AppSettings(temporary_directory=Path(self.tempdir.name) / "uploads"),
         )
-        created = service.import_pallet(
-            ConferenceImport(
-                self.actor, "caixas.csv", b64encode("|".join(codes).encode()).decode(),
-                "PORTAL", "DIGITAL", "AGENDA TESTE",
-            )
+        created = upload.importar_manual(
+            {
+                "filename": "caixas.csv", "content_base64": b64encode("|".join(codes).encode()).decode(),
+                "origin": "PORTAL", "operation": "DIGITAL", "agenda": "AGENDA TESTE",
+            }, self.actor,
         )
         service.start_pallet(created["public_id"], self.actor)
         return service, created
@@ -195,8 +195,9 @@ class ConferenceServiceTests(unittest.TestCase):
 
     def test_one_scan_confirms_all_repeated_rows_and_preserves_classes(self) -> None:
         self.service.cancel_pallet(self.public_id, self.actor)
-        service = ConferenceService(
-            self.repository,
+        service = ConferenceService(self.repository)
+        upload = UploadService(
+            service,
             ItemReader([
                 {"caixa_estoque": "000099", "ds_classe": "vestuario"},
                 {"caixa_estoque": "000099", "ds_classe": "calçados"},
@@ -204,7 +205,10 @@ class ConferenceServiceTests(unittest.TestCase):
             ]),
             AppSettings(temporary_directory=Path(self.tempdir.name) / "uploads"),
         )
-        created = service.import_pallet(ConferenceImport(self.actor, "repetido.csv", b64encode(b"x").decode(), "PORTAL", "DIGITAL"))
+        created = upload.importar_manual(
+            {"filename": "repetido.csv", "content_base64": b64encode(b"x").decode(), "origin": "PORTAL", "operation": "DIGITAL"},
+            self.actor,
+        )
         service.start_pallet(created["public_id"], self.actor)
         scanned = service.scan_carton(created["public_id"], "000099", self.actor)
         self.assertEqual("CONFERIDA", scanned["result"])
@@ -216,14 +220,16 @@ class ConferenceServiceTests(unittest.TestCase):
         self.assertEqual("DUPLICADA", service.scan_carton(created["public_id"], "000099", self.actor)["result"])
 
     def test_same_open_content_is_resumed_and_cancelled_content_creates_linked_record(self) -> None:
-        resumed = self.service.import_pallet(
-            ConferenceImport(self.actor, "renomeado.xlsx", b64encode(b"outro arquivo").decode(), "PORTAL", "DIGITAL", "AGENDA TESTE")
+        resumed = self.upload.importar_manual(
+            {"filename": "renomeado.xlsx", "content_base64": b64encode(b"outro arquivo").decode(), "origin": "PORTAL", "operation": "DIGITAL", "agenda": "AGENDA TESTE"},
+            self.actor,
         )
         self.assertEqual("resumed", resumed["action"])
         self.assertEqual(self.public_id, resumed["public_id"])
         self.service.cancel_pallet(self.public_id, self.actor)
-        recreated = self.service.import_pallet(
-            ConferenceImport(self.actor, "novo.csv", b64encode(b"other-content").decode(), "PORTAL", "DIGITAL", "AGENDA TESTE")
+        recreated = self.upload.importar_manual(
+            {"filename": "novo.csv", "content_base64": b64encode(b"other-content").decode(), "origin": "PORTAL", "operation": "DIGITAL", "agenda": "AGENDA TESTE"},
+            self.actor,
         )
         self.assertEqual("created_after_cancellation", recreated["action"])
         self.assertNotEqual(self.public_id, recreated["public_id"])
@@ -233,8 +239,9 @@ class ConferenceServiceTests(unittest.TestCase):
         other = ColaboradorRepository(self.database).create("000456", "OUTRO OPERADOR")
         other_actor = CollaboratorContext(int(other["id"]), str(other["matricula"]), str(other["nome"]))
         with self.assertRaises(ConflictError) as raised:
-            self.service.import_pallet(
-                ConferenceImport(other_actor, "mesmo-conteudo.xlsx", b64encode(b"outro").decode(), "PORTAL", "DIGITAL", "AGENDA TESTE")
+            self.upload.importar_manual(
+                {"filename": "mesmo-conteudo.xlsx", "content_base64": b64encode(b"outro").decode(), "origin": "PORTAL", "operation": "DIGITAL", "agenda": "AGENDA TESTE"},
+                other_actor,
             )
         self.assertEqual("CONTEUDO_EM_CONFERENCIA", raised.exception.code)
         self.assertEqual("000123", raised.exception.details["owner_registration"])
@@ -245,8 +252,9 @@ class ConferenceServiceTests(unittest.TestCase):
         for code in ("000001", "CX-002", "CX-003"):
             self.service.scan_carton(self.public_id, code, self.actor)
         finished = self.service.finish_pallet(self.public_id, self.actor)
-        blocked = self.service.import_pallet(
-            ConferenceImport(self.actor, "renomeado.csv", b64encode(b"outro").decode(), "PORTAL", "DIGITAL", "AGENDA TESTE")
+        blocked = self.upload.importar_manual(
+            {"filename": "renomeado.csv", "content_base64": b64encode(b"outro").decode(), "origin": "PORTAL", "operation": "DIGITAL", "agenda": "AGENDA TESTE"},
+            self.actor,
         )
         self.assertEqual("already_completed", blocked["action"])
         self.assertTrue(blocked["already_completed"])
@@ -255,8 +263,9 @@ class ConferenceServiceTests(unittest.TestCase):
         other_actor = CollaboratorContext(
             int(other["id"]), str(other["matricula"]), str(other["nome"]),
         )
-        blocked_for_other = self.service.import_pallet(
-            ConferenceImport(other_actor, "arquivo-com-outro-nome.csv", b64encode(b"conteudo diferente").decode(), "PORTAL", "DIGITAL", "000123")
+        blocked_for_other = self.upload.importar_manual(
+            {"filename": "arquivo-com-outro-nome.csv", "content_base64": b64encode(b"conteudo diferente").decode(), "origin": "PORTAL", "operation": "DIGITAL", "agenda": "000123"},
+            other_actor,
         )
         self.assertEqual("already_completed", blocked_for_other["action"])
         self.assertEqual(self.public_id, blocked_for_other["public_id"])
@@ -302,15 +311,14 @@ class ConferenceServiceTests(unittest.TestCase):
 
         def import_once() -> str:
             try:
-                return self.service.import_pallet(
-                    ConferenceImport(
-                        collaborator=self.actor,
-                        filename="concorrente.xlsx",
-                        content_base64=b64encode(b"conteudo-concorrente").decode(),
-                        origin="TL",
-                        operation="CROSS",
-                        agenda="AGENDA TESTE",
-                    )
+                return self.upload.importar_manual(
+                    {
+                        "filename": "concorrente.xlsx",
+                        "content_base64": b64encode(b"conteudo-concorrente").decode(),
+                        "origin": "TL",
+                        "operation": "CROSS",
+                        "agenda": "AGENDA TESTE",
+                    }, self.actor,
                 )["public_id"]
             except ConflictError as error:
                 return error.code
@@ -669,24 +677,20 @@ class ConferenceServiceTests(unittest.TestCase):
 
     def test_import_rejects_missing_collaborator_and_legacy_extension(self) -> None:
         self.service.cancel_pallet(self.public_id, self.actor)
-        without_agenda = ConferenceService(
-            self.repository,
+        without_agenda_service = ConferenceService(self.repository)
+        without_agenda = UploadService(
+            without_agenda_service,
             ConfiguredPalletReader(["SEM-AGENDA"]),
             AppSettings(temporary_directory=Path(self.tempdir.name) / "uploads"),
-        ).import_pallet(
-            ConferenceImport(self.actor, "sem-agenda.csv", b64encode(b"x").decode(), "PORTAL", "DIGITAL")
+        ).importar_manual(
+            {"filename": "sem-agenda.csv", "content_base64": b64encode(b"x").decode(), "origin": "PORTAL", "operation": "DIGITAL"},
+            self.actor,
         )
         self.assertEqual("", without_agenda["importation"]["agenda"])
         with self.assertRaisesRegex(ValidationError, "Identifique o colaborador"):
-            self.service.import_pallet(
-                ConferenceImport(
-                    collaborator=None,  # type: ignore[arg-type]
-                    filename="palete.csv",
-                    content_base64=b64encode(b"x").decode(),
-                    origin="PORTAL",
-                    operation="DIGITAL",
-                    agenda="AGENDA TESTE",
-                )
+            self.upload.importar_manual(
+                {"filename": "palete.csv", "content_base64": b64encode(b"x").decode(), "origin": "PORTAL", "operation": "DIGITAL", "agenda": "AGENDA TESTE"},
+                None,  # type: ignore[arg-type]
             )
 
     def test_database_reinitialization_preserves_conference_and_attempt(self) -> None:
@@ -708,15 +712,9 @@ class ConferenceServiceTests(unittest.TestCase):
             ]
         self.assertEqual([*range(1, 22), 23, 24], versions)
         with self.assertRaises(ValidationError):
-            self.service.import_pallet(
-                ConferenceImport(
-                    collaborator=self.actor,
-                    filename="palete.xls",
-                    content_base64=b64encode(b"x").decode(),
-                    origin="PORTAL",
-                    operation="DIGITAL",
-                    agenda="AGENDA TESTE",
-                )
+            self.upload.importar_manual(
+                {"filename": "palete.xls", "content_base64": b64encode(b"x").decode(), "origin": "PORTAL", "operation": "DIGITAL", "agenda": "AGENDA TESTE"},
+                self.actor,
             )
 
     def test_surplus_treatment_migrations_preserve_existing_conference_data(self) -> None:
@@ -965,17 +963,19 @@ class OfficialHttpFlowTests(unittest.TestCase):
         self.collaborators.create("001234", "COLABORADOR HTTP")
         repository = PalletRepository(self.database)
         settings = AppSettings(temporary_directory=Path(self.tempdir.name) / "uploads")
-        service = ConferenceService(repository, PalletFileImporter(), settings)
+        service = ConferenceService(repository)
+        self.downloads = Path(self.tempdir.name) / "Downloads"
+        self.downloads.mkdir()
+        upload_service = UploadService(
+            service, PalletFileImporter(), settings, (self.downloads,)
+        )
 
         class TestHandler(ApplicationHandler):
             pass
 
-        TestHandler.controller = ConferenceController(service)
+        TestHandler.controller = ConferenceController(service, upload_service)
         TestHandler.acesso_service = AcessoService(self.collaborators, settings)
         TestHandler.sessions = SessionManager()
-        self.downloads = Path(self.tempdir.name) / "Downloads"
-        self.downloads.mkdir()
-        TestHandler.automatic_report_service = AutomaticReportService(settings.max_upload_bytes, (self.downloads,))
 
         from http.server import ThreadingHTTPServer
 

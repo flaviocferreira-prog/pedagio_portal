@@ -1,26 +1,17 @@
 from __future__ import annotations
 
 import sqlite3
-import tempfile
-from base64 import b64decode
-from binascii import Error as Base64Error
-from hashlib import sha256
-from pathlib import Path
 from uuid import uuid4
 
-from conferencia.domain.box_codes import content_hash_caixa_estoque, normalize_caixa_estoque
+from conferencia.domain.box_codes import normalize_caixa_estoque
 from conferencia.domain.entities import (
     CollaboratorContext,
-    ConferenceImport,
     ScanClassification,
 )
-from conferencia.infrastructure.settings import AppSettings
-from conferencia.readers.excel_reader import PalletFileImporter
 from conferencia.regras_conferencia import mensagem_bloqueio_finalizacao_por_classe
 from conferencia.repositories.pallet_repository import (
     ActiveConferenceError,
     AmbiguousBoxCodeError,
-    ContentInProgressError,
     PalletRepository,
     PendingConferenceError,
     RepositoryStateError,
@@ -65,111 +56,9 @@ class InvalidScanError(ValidationError):
 
 
 class ConferenceService:
-    ORIGINS = frozenset({"PORTAL", "TL"})
-    OPERATIONS = frozenset({"DIGITAL", "NIKESTORE", "CROSS"})
     SHIFTS = frozenset({"T1", "T2", "T3", "ADM"})
-    def __init__(
-        self,
-        repository: PalletRepository,
-        excel_reader: PalletFileImporter,
-        settings: AppSettings | None = None,
-    ) -> None:
+    def __init__(self, repository: PalletRepository) -> None:
         self.repository = repository
-        self.excel_reader = excel_reader
-        self.settings = settings or AppSettings()
-
-    def import_pallet(self, import_data: ConferenceImport) -> dict:
-        collaborator = self._validate_collaborator(import_data.collaborator)
-        agenda = str(import_data.agenda or "").strip().upper()
-        origin = self._choice(import_data.origin, self.ORIGINS, "origem")
-        operation = self._choice(import_data.operation, self.OPERATIONS, "operação")
-        extension = self._safe_extension(import_data.filename)
-        content = self._decode_base64(
-            import_data.content_base64, self.settings.max_upload_bytes
-        )
-        self.settings.temporary_directory.mkdir(parents=True, exist_ok=True)
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                suffix=extension,
-                prefix="conference_",
-                dir=self.settings.temporary_directory,
-                delete=False,
-            ) as temporary_file:
-                temporary_file.write(content)
-                temporary_path = Path(temporary_file.name)
-            read_items = getattr(self.excel_reader, "read_expected_items", None)
-            expected_items = read_items(temporary_path, extension) if read_items else [
-                {"caixa_estoque": code, "ds_classe": ""}
-                for code in self.excel_reader.read_carton_codes(temporary_path, extension)
-            ]
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
-        carton_codes = [normalize_caixa_estoque(item["caixa_estoque"]) for item in expected_items]
-        carton_codes = [code for code in carton_codes if code]
-        if not carton_codes:
-            raise ValidationError("O arquivo não possui caixas estoque válidas.")
-        # Signature comes solely from the textual CAIXA_ESTOQUE multiset;
-        # filename, physical bytes, line order and workstation do not affect it.
-        fingerprint = getattr(self.excel_reader, "fingerprint", content_hash_caixa_estoque)
-        content_hash = fingerprint(carton_codes)
-        source_fingerprint = sha256(content + f"|{origin}|{operation}".encode()).hexdigest()
-        public_id = f"CONF-{uuid4().hex[:12].upper()}"
-        try:
-            decision = self.repository.create(
-                public_id,
-                collaborator,
-                import_data.filename,
-                expected_items,
-                source_fingerprint,
-                agenda,
-                origin,
-                operation,
-                collaborator.shift,
-                content_hash,
-            )
-        except ActiveConferenceError as error:
-            raise self._active_conference_error(error.public_id) from error
-        except ContentInProgressError as error:
-            raise self._content_in_progress_error(error) from error
-        except sqlite3.IntegrityError as error:
-            raise ConflictError(
-                "Não foi possível criar a conferência sem duplicidades.",
-                code="CONFERENCE_CREATION_CONFLICT",
-            ) from error
-        result = self.get_pallet(str(decision["public_id"]))
-        action = str(decision["action"])
-        if action == "already_completed":
-            result.update({
-                "action": action,
-                "already_completed": True,
-                "message": "Este arquivo já foi conferido e finalizado. Não é permitido iniciar uma nova conferência com o mesmo conteúdo.",
-                "can_authorize_reconference": collaborator.shift == "ADM",
-            })
-            return result
-        if action == "resumed":
-            owner = result["collaborator"]
-            result.update({
-                "action": action,
-                "message": (
-                    "Conferência já em andamento. Este palete já possui uma conferência aberta. "
-                    f"Iniciado por: {owner['name']}. Matrícula: {owner['registration']}. "
-                    f"Iniciado em: {result['importation']['imported_at']}. O progresso existente foi carregado."
-                ),
-            })
-            return result
-        return self._import_response(
-            result,
-            total_lines=len(carton_codes),
-            total_imported=len(carton_codes),
-            total_duplicates=0,
-            message=("Nova conferência criada a partir de conteúdo anteriormente cancelado." if action == "created_after_cancellation" else "Nova conferência criada com sucesso."),
-            action=action,
-            content_hash=content_hash,
-            previous_public_id=decision.get("previous_public_id"),
-        )
 
     def active_pallet(self, collaborator: CollaboratorContext) -> dict:
         actor = self._validate_collaborator(collaborator)
@@ -216,34 +105,6 @@ class ConferenceService:
             "message": "Reconferência autorizada e criada com sucesso.",
             "previous_public_id": previous["public_id"],
         })
-        return result
-
-    @staticmethod
-    def _import_response(
-        result: dict,
-        *,
-        total_lines: int,
-        total_imported: int,
-        total_duplicates: int,
-        message: str,
-        action: str = "created",
-        content_hash: str | None = None,
-        previous_public_id: object = None,
-    ) -> dict:
-        """Expõe a lista já confirmada no banco e os totais do upload."""
-        result.update(
-            {
-                "message": message,
-                "importacao_id": result["public_id"],
-                "total_linhas": total_lines,
-                "total_importadas": total_imported,
-                "total_duplicadas": total_duplicates,
-                "caixas": result["cartons"],
-                "action": action,
-                "content_hash": content_hash or result.get("content_hash"),
-                "previous_public_id": previous_public_id,
-            }
-        )
         return result
 
     def get_pallet(self, public_id: str) -> dict:
@@ -455,22 +316,6 @@ class ConferenceService:
         )
 
     @staticmethod
-    def _content_in_progress_error(error: ContentInProgressError) -> ConflictError:
-        owner = error.owner_name or "outro colaborador"
-        registration = error.owner_registration or "não informada"
-        timestamp = PalletRepository._format_local_datetime(
-            error.started_at or error.imported_at
-        )
-        message = f"Este conteúdo já está sendo conferido por {owner}. Matrícula: {registration}."
-        if timestamp:
-            message += f" Iniciada/importada em: {timestamp}."
-        return ConflictError(
-            message,
-            code="CONTEUDO_EM_CONFERENCIA",
-            details={"owner_registration": registration, "started_at": timestamp},
-        )
-
-    @staticmethod
     def _scan_response(classification: ScanClassification) -> tuple[str, str]:
         if classification == ScanClassification.MATCHED:
             return "CONFERIDA", "Caixa conferida com sucesso."
@@ -538,13 +383,6 @@ class ConferenceService:
         return collaborator
 
     @staticmethod
-    def _choice(value: object, allowed: frozenset[str], label: str) -> str:
-        normalized = value.strip().upper() if isinstance(value, str) else ""
-        if normalized not in allowed:
-            raise ValidationError(f"Selecione uma {label} válida.")
-        return normalized
-
-    @staticmethod
     def _required(value: str, label: str) -> str:
         cleaned = value.strip() if isinstance(value, str) else ""
         if not cleaned:
@@ -557,38 +395,3 @@ class ConferenceService:
         if not cleaned:
             raise ValidationError(f"{label} é obrigatória.")
         return cleaned
-
-    @staticmethod
-    def _decode_base64(value: str, max_bytes: int) -> bytes:
-        if not isinstance(value, str) or not value:
-            raise ValidationError("Conteúdo do arquivo é obrigatório.")
-        encoded = value.split(",", 1)[-1]
-        if len(encoded) > ((max_bytes + 2) // 3) * 4:
-            raise PayloadTooLargeError(
-                "Arquivo excede o limite configurado de 10 MB."
-            )
-        try:
-            content = b64decode(encoded, validate=True)
-        except Base64Error as error:
-            raise ValidationError("Conteúdo Base64 do arquivo é inválido.") from error
-        if len(content) > max_bytes:
-            raise PayloadTooLargeError(
-                "Arquivo excede o limite configurado de 10 MB."
-            )
-        return content
-
-    @staticmethod
-    def _safe_extension(filename: str) -> str:
-        if (
-            not filename
-            or Path(filename).name != filename
-            or "/" in filename
-            or "\\" in filename
-        ):
-            raise ValidationError("Nome de arquivo inválido.")
-        extension = Path(filename).suffix.lower()
-        if extension not in {".xlsx", ".csv"}:
-            raise ValidationError(
-                "Envie somente arquivos .xlsx ou .csv; .xls não é aceito."
-            )
-        return extension

@@ -30,13 +30,3 @@ class CollaboratorContext:
     registration: str
     name: str
     shift: str = "ADM"
-
-
-@dataclass(frozen=True, slots=True)
-class ConferenceImport:
-    collaborator: CollaboratorContext
-    filename: str
-    content_base64: str
-    origin: str
-    operation: str
-    agenda: str = ""

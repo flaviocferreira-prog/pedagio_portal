@@ -5,13 +5,14 @@ import unittest
 from base64 import b64encode
 from pathlib import Path
 
-from conferencia.domain.entities import CollaboratorContext, ConferenceImport
+from conferencia.domain.entities import CollaboratorContext
 from conferencia.infrastructure.database import SQLiteDatabase
 from conferencia.infrastructure.settings import AppSettings
 from conferencia.regras_conferencia import identificar_classe_palete
 from conferencia.repositories.colaborador_repository import ColaboradorRepository
 from conferencia.repositories.pallet_repository import PalletRepository
 from conferencia.services.conference_service import ConferenceService, ConflictError
+from conferencia.services.upload import UploadService
 
 
 class ItemReader:
@@ -47,19 +48,18 @@ class RegrasConferenciaTests(unittest.TestCase):
             {"caixa_estoque": f"{prefix}-{index}", "ds_classe": classe}
             for index, classe in enumerate(classes, start=1)
         ]
-        service = ConferenceService(
-            self.repository,
+        service = ConferenceService(self.repository)
+        created = UploadService(
+            service,
             ItemReader(items),
             AppSettings(temporary_directory=Path(self.tempdir.name) / "uploads"),
-        )
-        created = service.import_pallet(
-            ConferenceImport(
-                self.actor,
-                f"{prefix}.csv",
-                b64encode(prefix.encode()).decode(),
-                "PORTAL",
-                operation,
-            )
+        ).importar_manual(
+            {
+                "filename": f"{prefix}.csv",
+                "content_base64": b64encode(prefix.encode()).decode(),
+                "origin": "PORTAL",
+                "operation": operation,
+            }, self.actor,
         )
         public_id = created["public_id"]
         service.start_pallet(public_id, self.actor)

@@ -24,8 +24,8 @@ def main() -> int:
     from conferencia.repositories.colaborador_repository import ColaboradorRepository
     from conferencia.repositories.pallet_repository import PalletRepository
     from conferencia.services.acesso_service import AcessoService
-    from conferencia.services.automatic_report_service import AutomaticReportService
     from conferencia.services.conference_service import ConferenceService
+    from conferencia.services.upload import UploadService
     from conferencia.sincronizacao.client import GoogleSheetsClient
     from conferencia.sincronizacao.repository import SincronizacaoRepository
     from conferencia.sincronizacao.service import SincronizacaoService
@@ -44,11 +44,15 @@ def main() -> int:
     repository = PalletRepository(database)
     if args.port != settings.server_port:
         settings = replace(settings, server_port=args.port)
-    ApplicationHandler.controller = ConferenceController(ConferenceService(repository, PalletFileImporter(), settings))
+    conference_service = ConferenceService(repository)
+    upload_service = UploadService(conference_service, PalletFileImporter(), settings)
+    ApplicationHandler.controller = ConferenceController(
+        conference_service,
+        upload_service,
+    )
     ApplicationHandler.acesso_service = AcessoService(ColaboradorRepository(database))
     ApplicationHandler.sessions = SessionManager()
     ApplicationHandler.max_json_bytes = settings.max_json_bytes
-    ApplicationHandler.automatic_report_service = AutomaticReportService(settings.max_upload_bytes)
     ApplicationHandler.sincronizacao_service = SincronizacaoService(
         SincronizacaoRepository(database),
         GoogleSheetsClient(

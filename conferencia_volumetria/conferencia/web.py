@@ -29,7 +29,6 @@ from conferencia.services.conference_service import (
     PayloadTooLargeError,
     ValidationError,
 )
-from conferencia.services.automatic_report_service import AutomaticReportService
 from conferencia.sincronizacao.client import GoogleSyncError
 from conferencia.sincronizacao.service import SincronizacaoEmAndamentoError, SincronizacaoService
 
@@ -46,7 +45,6 @@ class ApplicationHandler(BaseHTTPRequestHandler):
     acesso_service: AcessoService
     sessions: SessionManager
     max_json_bytes = 15 * 1024 * 1024
-    automatic_report_service: AutomaticReportService | None = None
     sincronizacao_service: SincronizacaoService | None = None
 
     def do_GET(self) -> None:
@@ -73,9 +71,7 @@ class ApplicationHandler(BaseHTTPRequestHandler):
                     )
                 )
             if path == "/api/conferences/latest-wms-report":
-                if self.automatic_report_service is None:
-                    return self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AUTOMATIC_REPORT_UNAVAILABLE", "A busca automática não está configurada.")
-                return self._handle(self.automatic_report_service.latest)
+                return self._handle(self.controller.latest_wms_report)
             route = self._conference_route(path)
             if route is None:
                 return self._not_found()
@@ -140,14 +136,12 @@ class ApplicationHandler(BaseHTTPRequestHandler):
             )
         if path == "/api/conferences":
             return self._handle(
-                lambda: self.controller.import_pallet(payload, collaborator),
+                lambda: self.controller.import_manual_pallet(payload, collaborator),
                 HTTPStatus.CREATED,
             )
         if path == "/api/conferences/import-automatic":
-            if self.automatic_report_service is None:
-                return self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "AUTOMATIC_REPORT_UNAVAILABLE", "A busca automática não está configurada.")
             return self._handle(
-                lambda: self.controller.import_automatic_pallet(payload, collaborator, self.automatic_report_service),
+                lambda: self.controller.import_automatic_pallet(payload, collaborator),
                 HTTPStatus.CREATED,
             )
         route = self._conference_route(path)

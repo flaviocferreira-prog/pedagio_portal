@@ -1,55 +1,29 @@
 from __future__ import annotations
 
-from conferencia.domain.entities import CollaboratorContext, ConferenceImport
-from conferencia.services.conference_service import ConferenceService, ValidationError
-from conferencia.services.automatic_report_service import AutomaticReportService
-from conferencia.services.limpeza_downloads import limpar_relatorios_wms
-from base64 import b64encode
+from conferencia.domain.entities import CollaboratorContext
+from conferencia.services.conference_service import ConferenceService
+from conferencia.services.upload import UploadService
 
 
 class ConferenceController:
-    def __init__(self, service: ConferenceService) -> None:
+    def __init__(self, service: ConferenceService, upload_service: UploadService) -> None:
         self.service = service
+        self.upload_service = upload_service
 
-    def import_pallet(
+    def latest_wms_report(self) -> dict[str, object]:
+        return self.upload_service.localizar_ultimo_relatorio()
+
+    def import_manual_pallet(
         self,
         payload: dict[str, object],
         collaborator: CollaboratorContext,
     ) -> dict:
-        filename = payload.get("filename")
-        content_base64 = payload.get("content_base64")
-        agenda = payload.get("agenda", "")
-        origin = payload.get("origin")
-        operation = payload.get("operation")
-        if not all(isinstance(value, str) for value in (filename, content_base64, origin, operation)) or not isinstance(agenda, str):
-            raise ValidationError(
-                "Informe o nome e o conteúdo do arquivo para carregar o palete."
-            )
-        command = ConferenceImport(
-            collaborator=collaborator,
-            filename=filename,
-            content_base64=content_base64,
-            agenda=agenda,
-            origin=origin,
-            operation=operation,
-        )
-        return self.service.import_pallet(command)
+        return self.upload_service.importar_manual(payload, collaborator)
 
     def import_automatic_pallet(
-        self, payload: dict[str, object], collaborator: CollaboratorContext, reports: AutomaticReportService
+        self, payload: dict[str, object], collaborator: CollaboratorContext
     ) -> dict:
-        filename, content, downloads_directory = reports.read_for_import(
-            payload.get("automatic_file_id")
-        )
-        command_payload = dict(payload)
-        command_payload["filename"] = filename
-        command_payload["content_base64"] = b64encode(content).decode("ascii")
-        result = self.import_pallet(command_payload, collaborator)
-        limpar_relatorios_wms(
-            arquivo_em_uso=filename,
-            downloads_directory=downloads_directory,
-        )
-        return result
+        return self.upload_service.importar_automaticamente(payload, collaborator)
 
     def get_pallet(
         self, public_id: str, collaborator: CollaboratorContext
