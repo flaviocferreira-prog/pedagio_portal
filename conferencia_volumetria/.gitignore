@@ -1,0 +1,46 @@
+# Dados operacionais locais
+data/*.db
+data/temporary_uploads/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Ambientes e caches Python
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Credenciais e ferramentas locais
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.vscode/
+.idea/
+logs/*
+!logs/.gitkeep
+backups/*
+!backups/.gitkeep
+*.log
+temp/
+tmp/
+uploads/
+exports/
+generated/
+output/
+*.tmp
+*.bak
+*.swp
+~$*
