@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Conferência de Volumetria</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <main class="layout">
+        <section id="conference" class="card" hidden>
+            <div class="conference-heading">
+                <p class="eyebrow">PALETE ATIVO</p>
+                <div class="conference-heading-state">
+                    <h2 id="summary-id"></h2>
+                    <span id="summary-status" class="status-badge"></span>
+                </div>
+                <div class="conference-heading-actions" aria-label="Ações da conferência">
+                    <button id="logout-button" class="secondary conference-action" type="button" title="Trocar colaborador" aria-label="Trocar colaborador">
+                        <svg class="conference-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h11l-3-3m3 3-3 3M17 17H6l3 3m-3-3 3-3"/></svg>
+                    </button>
+                    <button id="new-import-button" class="conference-action" type="button" title="Nova importação" aria-label="Nova importação" hidden>
+                        <svg class="conference-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                    </button>
+                    <button id="sync-pending-button" class="secondary conference-action" type="button" title="Sincronizar pendentes" aria-label="Sincronizar pendentes">
+                        <svg class="conference-action__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-4M4 5v4h4M4 13a8 8 0 0 0 14.9 4M20 19v-4h-4"/></svg>
+                    </button>
+                </div>
+            </div>
+            <p id="summary-file" class="helper"></p>
+
+            <div class="conference-metadata" aria-label="Informações da conferência">
+                <span>Origem: <strong id="summary-origin"></strong></span>
+                <span>Operação: <strong id="summary-operation"></strong></span>
+                <span>Turno: <strong id="summary-shift"></strong></span>
+                <span>Importado em: <strong id="summary-imported-at"></strong></span>
+                <span>Colaborador: <strong id="summary-collaborator"></strong></span>
+                <span>Tentativa: <strong id="summary-attempt"></strong></span>
+                <span>Tempo: <strong id="summary-timer">00:00:00</strong></span>
+                <span id="summary-finalized-wrap" hidden><span id="summary-ended-label">Finalizada em</span> <strong id="summary-finalized-at"></strong></span>
+            </div>
+
+            <div class="summary">
+                <article><span>Esperadas</span><strong id="summary-expected">0</strong></article>
+                <article><span>Conferidas</span><strong id="summary-confirmed">0</strong></article>
+                <article><span>Faltantes</span><strong id="summary-pending">0</strong></article>
+                <article class="danger-card"><span>Sobras</span><strong id="summary-surplus">0</strong></article>
+                <article><span>Duplicadas</span><strong id="summary-duplicate">0</strong></article>
+                <article><span>Percentual</span><strong id="summary-coverage">0%</strong></article>
+                <article id="summary-pallet-class-card"><span>Classe do palete</span><strong id="summary-pallet-class">NÃO INFORMADO</strong></article>
+            </div>
+
+            <progress id="progress" value="0" max="100" aria-label="Progresso da conferência"></progress>
+
+            <div class="scan-controls">
+                <form id="carton-form" class="scan-form">
+                    <label for="carton-code">
+                        Bipar caixa
+                        <input id="carton-code" autocomplete="off" required
+                               aria-describedby="scan-helper">
+                    </label>
+                </form>
+                <div class="conference-actions">
+                    <button id="finish-button" type="button">Finalizar conferência</button>
+                    <button id="cancel-conference-button" class="danger-button" type="button">Cancelar conferência</button>
+                    <button id="authorize-reconference-button" class="danger-outline" type="button" hidden>Autorizar reconferência</button>
+                </div>
+            </div>
+            <p id="scan-helper" class="helper">Bipe ou cole o código; a conferência é automática.</p>
+            <section id="surplus-correction-notice" class="surplus-correction-notice" aria-live="polite" aria-hidden="true" hidden>
+                <strong>CORREÇÃO DE SOBRA</strong>
+                <span>Trate fisicamente a caixa e bipe novamente:</span>
+                <code id="surplus-correction-code"></code>
+                <button id="cancel-surplus-correction" class="secondary" type="button">Cancelar correção</button>
+            </section>
+
+
+            <div class="lists-grid">
+                <section>
+                    <div class="list-heading">
+                        <h3>Caixas esperadas</h3>
+                        <span id="box-count"></span>
+                    </div>
+                    <ul id="carton-list" class="box-list"></ul>
+                </section>
+                <section class="extra-panel">
+                    <div class="list-heading">
+                        <h3>Sobras identificadas</h3>
+                        <span id="extra-count"></span>
+                    </div>
+                    <ul id="extra-list" class="extra-list"></ul>
+                </section>
+            </div>
+        </section>
+
+        <dialog id="finish-modal" aria-labelledby="finish-title">
+            <form id="finish-form" method="dialog">
+                <h2 id="finish-title"><span id="finish-surplus-icon" class="finish-surplus-icon" aria-hidden="true" hidden>⚠</span><span id="finish-title-text">Finalizar conferência</span></h2>
+                <p id="finish-intro">Tem certeza de que deseja finalizar esta conferência? Após finalizar, não será possível bipar, cancelar ou alterar os dados.</p>
+                <section id="finish-surplus-details" class="finish-surplus-details" aria-labelledby="finish-surplus-list-title" hidden>
+                    <p id="finish-surplus-warning" class="finish-surplus-warning" hidden></p>
+                    <p class="finish-surplus-guidance">Antes de finalizar, verifique e trate fisicamente todas as sobras no palete.</p>
+                    <h3 id="finish-surplus-list-title">Sobras identificadas</h3>
+                    <ul id="finish-surplus-list" class="finish-surplus-list"></ul>
+                </section>
+                <div class="dialog-actions">
+                    <button id="finish-cancel" class="secondary" type="button">Voltar para a conferência</button>
+                    <button id="finish-confirm" type="submit">Confirmar finalização</button>
+                </div>
+            </form>
+        </dialog>
+        <dialog id="import-modal" aria-labelledby="import-title">
+            <form id="import-form" method="dialog">
+                <div class="dialog-heading"><h2 id="import-title">Nova importação</h2><button id="import-close" class="close-button" type="button" aria-label="Fechar">×</button></div>
+                <p class="helper">1. Arquivo</p>
+                <p id="automatic-file" class="helper" aria-live="polite"></p>
+                <label for="pallet-file">Escolher arquivo<input id="pallet-file" name="file" type="file" accept=".xlsx,.csv"></label>
+                <div id="import-dropzone" class="dropzone" tabindex="0">Arraste o arquivo aqui ou use o seletor acima.</div>
+                <p class="helper">2. Selecione a origem</p>
+                <div id="origin-choices" class="choice-grid" role="radiogroup" aria-label="Origem" aria-disabled="true">
+                    <button type="button" class="choice-button" data-origin="PORTAL" disabled>Portal</button>
+                    <button type="button" class="choice-button" data-origin="TL" disabled>TL</button>
+                </div>
+                <p class="helper">3. Selecione a operação</p>
+                <div id="operation-choices" class="choice-grid" role="radiogroup" aria-label="Operação" aria-disabled="true">
+                    <button type="button" class="choice-button" data-operation="DIGITAL" disabled>Digital</button>
+                    <button type="button" class="choice-button" data-operation="NIKESTORE" disabled>Nike Store</button>
+                    <button type="button" class="choice-button" data-operation="CROSS" disabled>Cross</button>
+                </div>
+                <p id="import-summary" class="helper">Selecione o arquivo, a origem e a operação para revisar a importação.</p>
+                <div class="dialog-actions"><button id="import-confirm" type="submit" disabled>Importar e Iniciar a Conferência</button></div>
+            </form>
+        </dialog>
+        <dialog id="cancel-conference-modal" aria-labelledby="cancel-conference-title">
+            <form id="cancel-conference-form" method="dialog">
+                <h2 id="cancel-conference-title">Cancelar conferência</h2>
+                <p>A conferência será interrompida. As caixas, leituras e divergências permanecerão no histórico.</p>
+                <p class="helper">Será necessário importar um novo arquivo para iniciar outra conferência.</p>
+                <div class="dialog-actions">
+                    <button id="cancel-conference-dismiss" class="secondary" type="button">Voltar</button>
+                    <button id="cancel-conference-confirm" class="danger-button" type="submit">Confirmar cancelamento</button>
+                </div>
+            </form>
+        </dialog>
+        <dialog id="reconference-modal" aria-labelledby="reconference-title">
+            <form id="reconference-form" method="dialog">
+                <h2 id="reconference-title">Autorizar reconferência</h2>
+                <p>Uma nova conferência será criada, preservando integralmente o resultado anterior.</p>
+                <label for="reconference-reason">Justificativa (mínimo de 10 caracteres)<textarea id="reconference-reason" required minlength="10"></textarea></label>
+                <div class="dialog-actions">
+                    <button id="reconference-dismiss" class="secondary" type="button">Voltar</button>
+                    <button id="reconference-confirm" class="danger-button" type="submit">Autorizar</button>
+                </div>
+            </form>
+        </dialog>
+    </main>
+    <aside id="surplus-alert" class="surplus-alert" role="alert" aria-live="assertive" aria-atomic="true" hidden aria-hidden="true">
+        <strong id="surplus-alert-title"></strong>
+        <span id="surplus-alert-summary"></span>
+        <span id="surplus-alert-code"></span>
+        <span id="surplus-alert-guidance"></span>
+    </aside>
+    <aside id="mixed-pallet-alert" class="mixed-pallet-alert" role="alert" aria-live="assertive" aria-atomic="true" hidden aria-hidden="true">
+        <strong>O PALETE ESTÁ MISTO E PRECISA SER TRATADO ANTES DA FINALIZAÇÃO.</strong>
+    </aside>
+    <script type="module" src="/static/js/main.js"></script>
+</body>
+</html>
