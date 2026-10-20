@@ -6,7 +6,7 @@ Aplicação web local em Python puro para conferência física de caixas de um p
 
 Para uso operacional, baixe o ZIP portátil na página de Releases, extraia-o em uma pasta como `Documentos\PEDAGIO_PORTAL` e execute `INSTALAR_PEDAGIO.bat`. O instalador não baixa código, não move o projeto e não instala Python ou bibliotecas: ele valida o runtime já empacotado, preserva dados operacionais e cria o atalho **Alerta Logística** na Área de Trabalho do usuário.
 
-Requisitos: Windows 10/11, permissão de escrita na pasta do projeto e Python 3.11 ou superior previamente instalado por meio aprovado pela TI. Em instalações novas, o instalador prioriza Python 3.13 ou 3.12 quando estão disponíveis. Ele não altera o Python global, proxy, certificados ou políticas de segurança.
+Requisitos do pacote portátil: Windows 10/11 e permissão de escrita na pasta do projeto. Python e as bibliotecas já acompanham o pacote; Python 3.11 ou superior é necessário somente para reproduzir o build de desenvolvimento. O instalador não altera o Python global, proxy, certificados ou políticas de segurança.
 
 Para reparar o runtime, baixe novamente o ZIP de Release e extraia-o sobre os arquivos da aplicação, sem substituir `data/`, `logs/`, `backups/` ou `.env`. Depois da instalação, abra **Alerta Logística**. O atalho identifica a instância local antes de abrir o navegador e não encerra processos desconhecidos. Os diagnósticos do instalador ficam em `logs\instalacao_pedagio.log`; os do servidor ficam em `logs\servidor_saida.log` e `logs\servidor_erro.log`.
 
