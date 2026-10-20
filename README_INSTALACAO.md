@@ -1,6 +1,6 @@
 # PEDAGIO PORTAL portátil
 
-1. Baixe `PEDAGIO_PORTAL_PORTATIL_v1.0.0.zip` na página de Releases.
+1. Baixe `PEDAGIO_PORTAL_PORTATIL_v1.0.1.zip` na página de Releases.
 2. Extraia a pasta `PEDAGIO_PORTAL` em `Documentos` ou em outro diretório com permissão de escrita.
 3. Execute `INSTALAR_PEDAGIO.bat` uma vez. Ele cria os diretórios operacionais e o atalho **Alerta Logística**; não instala Python nem baixa bibliotecas.
 4. Abra o atalho ou execute `INICIAR_PEDAGIO.bat`.

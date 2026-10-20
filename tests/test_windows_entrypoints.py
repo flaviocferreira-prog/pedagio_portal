@@ -11,26 +11,21 @@ class WindowsEntrypointContractTests(unittest.TestCase):
         cls.installer = (root / "INSTALAR_PEDAGIO.bat").read_text(encoding="utf-8")
         cls.launcher = (root / "INICIAR_PEDAGIO.bat").read_text(encoding="utf-8")
 
-    def test_installer_preserves_operational_data_and_supports_repair(self) -> None:
-        self.assertIn("--repair", self.installer)
-        self.assertIn(".venv.backup", self.installer)
-        self.assertIn('move "%VENV%" "%VENV_BACKUP%"', self.installer)
+    def test_installer_preserves_operational_data_and_validates_portable_runtime(self) -> None:
+        self.assertIn("PEDAGIO_PORTAL.exe", self.installer)
+        self.assertIn("_internal", self.installer)
         self.assertIn('if not exist "%ROOT%\\.env"', self.installer)
         self.assertIn("data\\temporary_uploads", self.installer)
         self.assertNotIn("rmdir /s", self.installer.lower())
         self.assertNotIn("del /", self.installer.lower())
 
-    def test_installer_checks_supported_python_and_dependencies(self) -> None:
-        self.assertIn("3.13 3.12 3.11 3.14", self.installer)
-        self.assertIn("sys.version_info >= (3, 11)", self.installer)
-        self.assertIn("-m venv", self.installer)
-        self.assertIn("-m pip install", self.installer)
-        self.assertIn("-m pip check", self.installer)
-        self.assertIn("import openpyxl, tzdata, dotenv", self.installer)
+    def test_installer_does_not_download_or_install_dependencies(self) -> None:
+        self.assertIn("Nenhuma biblioteca foi instalada", self.installer)
+        self.assertNotIn("-m pip", self.installer)
+        self.assertNotIn("-m venv", self.installer)
 
     def test_portable_distribution_uses_the_bundled_executable(self) -> None:
-        self.assertIn("PORTABLE_EXE", self.installer)
-        self.assertIn("nenhuma biblioteca sera instalada", self.installer)
+        self.assertIn("PEDAGIO_PORTAL.exe", self.installer)
         self.assertIn("APP_EXE", self.launcher)
         self.assertIn("PEDAGIO_PORTAL.exe", self.launcher)
 

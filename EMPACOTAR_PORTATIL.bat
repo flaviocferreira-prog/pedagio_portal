@@ -5,7 +5,7 @@ pushd "%ROOT%" >nul 2>&1 || exit /b 1
 set "ROOT=%CD%"
 set "DIST=%ROOT%\dist\PEDAGIO_PORTAL"
 set "RELEASE=%ROOT%\release"
-set "PACKAGE=%RELEASE%\PEDAGIO_PORTAL_PORTATIL_v1.0.0.zip"
+set "PACKAGE=%RELEASE%\PEDAGIO_PORTAL_PORTATIL_v1.0.1.zip"
 
 if not exist "%DIST%\PEDAGIO_PORTAL.exe" (
   echo [ERRO] Executavel nao encontrado. Execute GERAR_PORTATIL.bat antes.
