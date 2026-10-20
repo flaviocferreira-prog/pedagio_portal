@@ -19,6 +19,7 @@ from conferencia.infrastructure.session_manager import (
     SessionManager,
 )
 from conferencia.infrastructure.logging_utils import log_http_access, log_sanitized_exception
+from conferencia.infrastructure.paths import resource_root
 from conferencia.readers.excel_reader import ExcelReadError
 from conferencia.services.acesso_service import AcessoService
 from conferencia.services.conference_service import (
@@ -32,7 +33,7 @@ from conferencia.services.conference_service import (
 from conferencia.sincronizacao.client import GoogleSyncError
 from conferencia.sincronizacao.service import SincronizacaoEmAndamentoError, SincronizacaoService
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = resource_root()
 STATIC_ROOT = PROJECT_ROOT / "static"
 
 

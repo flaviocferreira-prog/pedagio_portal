@@ -1,0 +1,2 @@
+# Dependencia exclusiva para gerar a distribuicao Windows; nao e necessaria ao usuario final.
+pyinstaller>=6.0,<7.0

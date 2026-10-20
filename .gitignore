@@ -10,6 +10,11 @@ data/temporary_uploads/
 
 # Ambientes e caches Python
 .venv/
+.venv.backup*/
+build/
+dist/
+release/
+*.spec
 venv/
 env/
 ENV/

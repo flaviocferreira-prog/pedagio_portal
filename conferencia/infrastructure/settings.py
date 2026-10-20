@@ -6,8 +6,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from conferencia.infrastructure.paths import runtime_root
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+PROJECT_ROOT = runtime_root()
 load_dotenv(PROJECT_ROOT / ".env")
 
 
@@ -16,7 +18,7 @@ class AppSettings:
     max_upload_bytes: int = int(os.getenv("CONFERENCE_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
     collaborator_registration_min_length: int = int(os.getenv("CONFERENCE_REGISTRATION_MIN_LENGTH", "1"))
     collaborator_registration_max_length: int = int(os.getenv("CONFERENCE_REGISTRATION_MAX_LENGTH", "20"))
-    temporary_directory: Path = Path(__file__).resolve().parents[2] / "data" / "temporary_uploads"
+    temporary_directory: Path = PROJECT_ROOT / "data" / "temporary_uploads"
     logs_directory: Path = PROJECT_ROOT / "logs"
     backups_directory: Path = PROJECT_ROOT / "backups"
     server_port: int = int(os.getenv("CONFERENCE_PORT", "8080"))

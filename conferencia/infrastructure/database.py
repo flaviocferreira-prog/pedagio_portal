@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Iterator
 
 from conferencia.domain.box_codes import content_hash_caixa_estoque
+from conferencia.infrastructure.paths import runtime_root
 
 
 class SQLiteDatabase:
     """Conexões SQLite e migrações incrementais, sem reset destrutivo."""
 
     def __init__(self, database_path: Path | None = None) -> None:
-        self.database_path = database_path or Path(__file__).resolve().parents[2] / "data" / "conferencia.db"
+        self.database_path = database_path or runtime_root() / "data" / "conferencia.db"
 
     def connect(self) -> sqlite3.Connection:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)

@@ -4,9 +4,21 @@ Aplicação web local em Python puro para conferência física de caixas de um p
 
 ## Instalação para o colaborador
 
-O colaborador executa somente `instalar.bat`. Ele baixa a versão atual do GitHub, instala em `Documentos\Conferencia Volumetria`, prepara Python 3.11 ou superior quando necessário, cria o ambiente virtual, banco SQLite, `.env`, logs, backups e o atalho **CONFERENCIA VOLUMETRIA** na Área de Trabalho.
+O projeto deve permanecer na pasta em que foi entregue, por exemplo `Documentos\PEDAGIO_PORTAL`. Execute `INSTALAR_PEDAGIO.bat` nessa pasta. O instalador não baixa código nem move o projeto: ele cria ou valida a `.venv`, instala as dependências declaradas, preserva dados operacionais e cria o atalho **Alerta Logística** na Área de Trabalho do usuário.
 
-O atalho inicia o servidor local, espera a resposta e abre o navegador uma única vez. Novos cliques enquanto o servidor estiver ativo não criam outras abas.
+Requisitos: Windows 10/11, permissão de escrita na pasta do projeto e Python 3.11 ou superior previamente instalado por meio aprovado pela TI. Em instalações novas, o instalador prioriza Python 3.13 ou 3.12 quando estão disponíveis. Ele não altera o Python global, proxy, certificados ou políticas de segurança.
+
+Para reparar uma `.venv` que não inicia, execute:
+
+```bat
+INSTALAR_PEDAGIO.bat --repair
+```
+
+Esse modo move apenas a `.venv` com problema para uma pasta `.venv.backup*` antes de reconstruí-la. Ele nunca remove `data/`, `logs/`, `backups/`, SQLite, CSVs, relatórios ou um `.env` existente.
+
+Depois da instalação, abra **Alerta Logística**. O atalho identifica a instância local antes de abrir o navegador e não encerra processos desconhecidos. Os diagnósticos do instalador ficam em `logs\instalacao_pedagio.log`; os do servidor ficam em `logs\servidor_saida.log` e `logs\servidor_erro.log`.
+
+O atalho abre somente a ferramenta local. Caso seja necessário, o acesso ao Senior deve ser aberto manualmente em `https://platform.senior.com.br/login/?redirectTo=https://platform.senior.com.br/senior-x/&tenant=gruposbf.com.br`.
 
 ## Fluxo oficial
 

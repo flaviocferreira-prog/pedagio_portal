@@ -30,10 +30,17 @@ class RuntimeRequirementTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         self.assertIn("Python 3.11 ou superior", (root / "README.md").read_text(encoding="utf-8"))
         self.assertIn("Python >= 3.11", (root / "requirements.txt").read_text(encoding="utf-8"))
-        for filename in ("instalar.bat", "iniciar.bat"):
-            content = (root / filename).read_text(encoding="utf-8")
-            self.assertIn("sys.version_info >= (3, 11)", content)
-            self.assertIn("Python %PYTHON_VERSION% encontrado", content)
+        installer = (root / "INSTALAR_PEDAGIO.bat").read_text(encoding="utf-8")
+        launcher = (root / "INICIAR_PEDAGIO.bat").read_text(encoding="utf-8")
+        self.assertIn("sys.version_info >= (3, 11)", installer)
+        self.assertIn(".venv", installer)
+        self.assertIn("--repair", installer)
+        self.assertIn("pip check", installer)
+        self.assertIn("Alerta Log", installer)
+        self.assertIn("CONFERENCE_PORT", launcher)
+        self.assertIn("access-form", launcher)
+        self.assertNotIn("ExecutionPolicy Bypass", installer)
+        self.assertNotIn("ExecutionPolicy Bypass", launcher)
 
 
 class SanitizedLoggingTests(unittest.TestCase):
